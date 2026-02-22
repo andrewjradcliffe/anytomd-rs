@@ -118,7 +118,7 @@ println!("{}", result.markdown);
 
 ### Plain Text Output
 
-Get plain text with all Markdown formatting stripped — useful for full-text search indexing, LLM preprocessing, and text analytics.
+Every conversion produces both Markdown and plain text output. The plain text is extracted directly from the source document — no post-processing or markdown stripping — so source characters like `**kwargs` or `# comment` are preserved exactly.
 
 ```rust
 use anytomd::{convert_file, ConversionOptions};
@@ -128,8 +128,8 @@ let result = convert_file("document.docx", &ConversionOptions::default()).unwrap
 // Markdown output
 println!("{}", result.markdown);
 
-// Plain text output (headings, bold, tables, links, etc. stripped)
-println!("{}", result.plain_text());
+// Plain text output (no headings, bold, tables, code fences, etc.)
+println!("{}", result.plain_text);
 ```
 
 ### Extracting Embedded Images
@@ -277,14 +277,10 @@ pub async fn convert_bytes_async(
 ```rust
 pub struct ConversionResult {
     pub markdown: String,                  // The converted Markdown
+    pub plain_text: String,                // Plain text (extracted directly, no markdown syntax)
     pub title: Option<String>,             // Document title, if detected
     pub images: Vec<(String, Vec<u8>)>,    // Extracted images (filename, bytes)
     pub warnings: Vec<ConversionWarning>,  // Recoverable issues encountered
-}
-
-impl ConversionResult {
-    /// Returns the content as plain text with Markdown formatting removed.
-    pub fn plain_text(&self) -> String;
 }
 ```
 

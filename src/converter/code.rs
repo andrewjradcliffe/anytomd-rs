@@ -81,9 +81,11 @@ impl CodeConverter {
         let language = language_for_extension(extension).unwrap_or("code");
         let content = text.trim_end();
         let markdown = format!("```{language}\n{content}\n```\n");
+        let plain_text = format!("{content}\n");
 
         Ok(ConversionResult {
             markdown,
+            plain_text,
             warnings,
             ..Default::default()
         })
@@ -232,6 +234,28 @@ mod tests {
             .convert_with_extension(b"int x;", "hpp", &ConversionOptions::default())
             .unwrap();
         assert!(result.markdown.starts_with("```cpp\n"));
+    }
+
+    #[test]
+    fn test_code_plain_text_no_fences() {
+        let converter = CodeConverter;
+        let input = b"def hello():\n    print('Hello')\n";
+        let result = converter
+            .convert_with_extension(input, "py", &ConversionOptions::default())
+            .unwrap();
+        assert!(!result.plain_text.contains("```"));
+        assert!(result.plain_text.contains("def hello():"));
+        assert!(result.plain_text.contains("print('Hello')"));
+    }
+
+    #[test]
+    fn test_code_plain_text_empty_input() {
+        let converter = CodeConverter;
+        let result = converter
+            .convert_with_extension(b"", "py", &ConversionOptions::default())
+            .unwrap();
+        assert_eq!(result.plain_text, "\n");
+        assert!(!result.plain_text.contains("```"));
     }
 
     #[test]

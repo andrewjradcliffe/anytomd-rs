@@ -65,10 +65,8 @@ impl ImageConverter {
             });
             return Ok((
                 ConversionResult {
-                    markdown: String::new(),
-                    title: None,
-                    images: Vec::new(),
                     warnings,
+                    ..Default::default()
                 },
                 PendingImageResolution::default(),
             ));
@@ -76,6 +74,7 @@ impl ImageConverter {
 
         let placeholder = "__img_0__".to_string();
         let markdown = format!("![{placeholder}]({filename})\n");
+        let plain_text = format!("{placeholder}\n");
 
         let image_infos = vec![ImageInfo {
             placeholder,
@@ -95,9 +94,10 @@ impl ImageConverter {
 
         let result = ConversionResult {
             markdown,
-            title: None,
+            plain_text,
             images,
             warnings,
+            ..Default::default()
         };
 
         let pending = PendingImageResolution {
@@ -127,6 +127,7 @@ impl Converter for ImageConverter {
         let (mut result, pending) = self.convert_inner(data, options)?;
         resolve_image_placeholders(
             &mut result.markdown,
+            &mut result.plain_text,
             &pending.infos,
             &pending.bytes,
             options.image_describer.as_deref(),
@@ -326,6 +327,53 @@ mod tests {
             .convert(data, &ConversionOptions::default())
             .unwrap();
         assert_eq!(result.markdown, "![](image.gif)\n");
+    }
+
+    #[test]
+    fn test_image_plain_text_no_markdown_syntax() {
+        let converter = ImageConverter;
+        let result = converter
+            .convert(&PNG_HEADER, &ConversionOptions::default())
+            .unwrap();
+        // Plain text should not contain markdown image syntax
+        assert!(!result.plain_text.contains("!["));
+        assert!(!result.plain_text.contains("]("));
+    }
+
+    #[test]
+    fn test_image_plain_text_with_describer() {
+        let converter = ImageConverter;
+        let options = ConversionOptions {
+            image_describer: Some(Arc::new(MockDescriber {
+                description: "A sunset over the ocean".to_string(),
+            })),
+            ..Default::default()
+        };
+        let result = converter.convert(&PNG_HEADER, &options).unwrap();
+        assert_eq!(result.plain_text, "A sunset over the ocean\n");
+    }
+
+    #[test]
+    fn test_image_plain_text_describer_error_fallback() {
+        let converter = ImageConverter;
+        let options = ConversionOptions {
+            image_describer: Some(Arc::new(FailingDescriber)),
+            ..Default::default()
+        };
+        let result = converter.convert(&PNG_HEADER, &options).unwrap();
+        // Falls back to empty original_alt
+        assert_eq!(result.plain_text, "\n");
+    }
+
+    #[test]
+    fn test_image_plain_text_byte_budget_exceeded() {
+        let converter = ImageConverter;
+        let options = ConversionOptions {
+            max_total_image_bytes: 4,
+            ..Default::default()
+        };
+        let result = converter.convert(&PNG_HEADER, &options).unwrap();
+        assert!(result.plain_text.is_empty());
     }
 
     #[test]

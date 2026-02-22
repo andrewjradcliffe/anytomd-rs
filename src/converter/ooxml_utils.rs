@@ -147,10 +147,11 @@ pub(crate) fn resolve_relative_to_file(base_file: &str, target: &str) -> String 
     }
 }
 
-/// Replace image placeholders in markdown with descriptions from the describer,
-/// or fall back to the original alt text.
+/// Replace image placeholders in markdown and plain text with descriptions
+/// from the describer, or fall back to the original alt text.
 pub(crate) fn resolve_image_placeholders(
     markdown: &mut String,
+    plain_text: &mut String,
     image_infos: &[ImageInfo],
     image_bytes: &HashMap<String, Vec<u8>>,
     describer: Option<&dyn ImageDescriber>,
@@ -169,6 +170,7 @@ pub(crate) fn resolve_image_placeholders(
                             &description,
                             &info.filename,
                         );
+                        *plain_text = plain_text.replacen(&info.placeholder, &description, 1);
                     }
                     Err(e) => {
                         *markdown = replace_image_alt_by_placeholder(
@@ -177,6 +179,7 @@ pub(crate) fn resolve_image_placeholders(
                             &info.original_alt,
                             &info.filename,
                         );
+                        *plain_text = plain_text.replacen(&info.placeholder, &info.original_alt, 1);
                         warnings.push(ConversionWarning {
                             code: WarningCode::SkippedElement,
                             message: format!(
@@ -194,6 +197,7 @@ pub(crate) fn resolve_image_placeholders(
                     &info.original_alt,
                     &info.filename,
                 );
+                *plain_text = plain_text.replacen(&info.placeholder, &info.original_alt, 1);
             }
         }
     } else {
@@ -204,6 +208,7 @@ pub(crate) fn resolve_image_placeholders(
                 &info.original_alt,
                 &info.filename,
             );
+            *plain_text = plain_text.replacen(&info.placeholder, &info.original_alt, 1);
         }
     }
 }
@@ -216,6 +221,7 @@ pub(crate) fn resolve_image_placeholders(
 #[cfg(feature = "async")]
 pub(crate) async fn resolve_image_placeholders_async(
     markdown: &mut String,
+    plain_text: &mut String,
     image_infos: &[ImageInfo],
     image_bytes: &HashMap<String, Vec<u8>>,
     describer: &dyn crate::converter::AsyncImageDescriber,
@@ -254,6 +260,7 @@ pub(crate) async fn resolve_image_placeholders_async(
                 &desc,
                 &info.filename,
             );
+            *plain_text = plain_text.replacen(&info.placeholder, &desc, 1);
         } else {
             *markdown = replace_image_alt_by_placeholder(
                 markdown,
@@ -261,6 +268,7 @@ pub(crate) async fn resolve_image_placeholders_async(
                 &info.original_alt,
                 &info.filename,
             );
+            *plain_text = plain_text.replacen(&info.placeholder, &info.original_alt, 1);
             if let Some(e) = error {
                 warnings.push(ConversionWarning {
                     code: WarningCode::SkippedElement,
@@ -377,6 +385,7 @@ mod tests {
     #[test]
     fn test_resolve_image_placeholders_no_describer() {
         let mut md = "![__img_0__](cat.png)\n![__img_1__](dog.png)".to_string();
+        let mut pt = "__img_0__\n__img_1__".to_string();
         let infos = vec![
             ImageInfo {
                 placeholder: "__img_0__".to_string(),
@@ -391,9 +400,12 @@ mod tests {
         ];
         let image_bytes = HashMap::new();
         let mut warnings = Vec::new();
-        resolve_image_placeholders(&mut md, &infos, &image_bytes, None, &mut warnings);
+        resolve_image_placeholders(&mut md, &mut pt, &infos, &image_bytes, None, &mut warnings);
         assert!(md.contains("![A cat](cat.png)"));
         assert!(md.contains("![A dog](dog.png)"));
+        assert!(pt.contains("A cat"));
+        assert!(pt.contains("A dog"));
+        assert!(!pt.contains("__img_"));
         assert!(warnings.is_empty());
     }
 
@@ -415,6 +427,7 @@ mod tests {
         }
 
         let mut md = "![__img_0__](cat.png)".to_string();
+        let mut pt = "__img_0__".to_string();
         let infos = vec![ImageInfo {
             placeholder: "__img_0__".to_string(),
             original_alt: "A cat".to_string(),
@@ -426,12 +439,14 @@ mod tests {
         let describer = MockDescriber;
         resolve_image_placeholders(
             &mut md,
+            &mut pt,
             &infos,
             &image_bytes,
             Some(&describer),
             &mut warnings,
         );
         assert!(md.contains("![LLM description](cat.png)"));
+        assert_eq!(pt, "LLM description");
         assert!(warnings.is_empty());
     }
 
@@ -455,6 +470,7 @@ mod tests {
         }
 
         let mut md = "![__img_0__](cat.png)".to_string();
+        let mut pt = "__img_0__".to_string();
         let infos = vec![ImageInfo {
             placeholder: "__img_0__".to_string(),
             original_alt: "A cat".to_string(),
@@ -466,12 +482,14 @@ mod tests {
         let describer = FailingDescriber;
         resolve_image_placeholders(
             &mut md,
+            &mut pt,
             &infos,
             &image_bytes,
             Some(&describer),
             &mut warnings,
         );
         assert!(md.contains("![A cat](cat.png)"));
+        assert_eq!(pt, "A cat");
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].message.contains("image description failed"));
     }
@@ -519,6 +537,7 @@ mod tests {
         #[tokio::test]
         async fn test_resolve_image_placeholders_async_with_describer() {
             let mut md = "![__img_0__](cat.png)\n![__img_1__](dog.png)".to_string();
+            let mut pt = "__img_0__\n__img_1__".to_string();
             let infos = vec![
                 ImageInfo {
                     placeholder: "__img_0__".to_string(),
@@ -538,6 +557,7 @@ mod tests {
             let describer = MockAsyncDescriber;
             resolve_image_placeholders_async(
                 &mut md,
+                &mut pt,
                 &infos,
                 &image_bytes,
                 &describer,
@@ -546,12 +566,15 @@ mod tests {
             .await;
             assert!(md.contains("![async description](cat.png)"));
             assert!(md.contains("![async description](dog.png)"));
+            assert!(pt.contains("async description"));
+            assert!(!pt.contains("__img_"));
             assert!(warnings.is_empty());
         }
 
         #[tokio::test]
         async fn test_resolve_image_placeholders_async_error_fallback() {
             let mut md = "![__img_0__](cat.png)".to_string();
+            let mut pt = "__img_0__".to_string();
             let infos = vec![ImageInfo {
                 placeholder: "__img_0__".to_string(),
                 original_alt: "A cat".to_string(),
@@ -563,6 +586,7 @@ mod tests {
             let describer = FailingAsyncDescriber;
             resolve_image_placeholders_async(
                 &mut md,
+                &mut pt,
                 &infos,
                 &image_bytes,
                 &describer,
@@ -570,6 +594,7 @@ mod tests {
             )
             .await;
             assert!(md.contains("![A cat](cat.png)"));
+            assert_eq!(pt, "A cat");
             assert_eq!(warnings.len(), 1);
             assert!(warnings[0].message.contains("image description failed"));
         }
@@ -577,6 +602,7 @@ mod tests {
         #[tokio::test]
         async fn test_resolve_image_placeholders_async_missing_bytes() {
             let mut md = "![__img_0__](cat.png)".to_string();
+            let mut pt = "__img_0__".to_string();
             let infos = vec![ImageInfo {
                 placeholder: "__img_0__".to_string(),
                 original_alt: "A cat".to_string(),
@@ -587,6 +613,7 @@ mod tests {
             let describer = MockAsyncDescriber;
             resolve_image_placeholders_async(
                 &mut md,
+                &mut pt,
                 &infos,
                 &image_bytes,
                 &describer,
@@ -595,6 +622,7 @@ mod tests {
             .await;
             // Falls back to original alt text
             assert!(md.contains("![A cat](cat.png)"));
+            assert_eq!(pt, "A cat");
             assert!(warnings.is_empty());
         }
     }

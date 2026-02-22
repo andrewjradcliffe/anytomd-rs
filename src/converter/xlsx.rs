@@ -14,7 +14,7 @@ use crate::converter::{
     ConversionOptions, ConversionResult, ConversionWarning, Converter, WarningCode,
 };
 use crate::error::ConvertError;
-use crate::markdown::{build_table, format_heading};
+use crate::markdown::{build_table, build_table_plain, format_heading};
 use crate::zip_utils::{read_zip_bytes, read_zip_text};
 
 pub struct XlsxConverter;
@@ -253,6 +253,7 @@ impl XlsxConverter {
 
         let sheet_names = workbook.sheet_names().to_owned();
         let mut sections = Vec::new();
+        let mut plain_sections = Vec::new();
         let mut warnings = Vec::new();
 
         // Track which sheet index each section corresponds to (for image attachment)
@@ -312,6 +313,10 @@ impl XlsxConverter {
             let heading = format_heading(2, name);
             let table = build_table(&header_refs, &row_refs);
             sections.push(format!("{heading}{table}"));
+
+            let plain_table = build_table_plain(&header_refs, &row_refs);
+            plain_sections.push(format!("{name}\n{plain_table}"));
+
             section_sheet_indices.push(sheet_idx);
         }
 
@@ -365,9 +370,11 @@ impl XlsxConverter {
         }
 
         let markdown = sections.join("\n");
+        let plain_text = plain_sections.join("\n");
 
         let result = ConversionResult {
             markdown,
+            plain_text,
             images,
             warnings,
             ..Default::default()
@@ -397,6 +404,7 @@ impl Converter for XlsxConverter {
         let (mut result, pending) = self.convert_inner(data, options)?;
         resolve_image_placeholders(
             &mut result.markdown,
+            &mut result.plain_text,
             &pending.infos,
             &pending.bytes,
             options.image_describer.as_deref(),

@@ -39,6 +39,7 @@ impl Converter for IpynbConverter {
         let language = detect_language(obj);
 
         let mut sections: Vec<String> = Vec::new();
+        let mut plain_sections: Vec<String> = Vec::new();
         let mut title: Option<String> = None;
         let mut warnings: Vec<ConversionWarning> = Vec::new();
 
@@ -52,17 +53,20 @@ impl Converter for IpynbConverter {
                         title = extract_heading_title(&source);
                     }
                     if !source.is_empty() {
-                        sections.push(source);
+                        sections.push(source.clone());
+                        plain_sections.push(source);
                     }
                 }
                 "code" => {
                     if !source.is_empty() {
                         sections.push(format!("```{language}\n{source}\n```"));
+                        plain_sections.push(source);
                     }
                 }
                 "raw" => {
                     if !source.is_empty() {
                         sections.push(format!("```\n{source}\n```"));
+                        plain_sections.push(source);
                     }
                 }
                 _ => {
@@ -86,9 +90,11 @@ impl Converter for IpynbConverter {
         }
 
         let markdown = sections.join("\n\n");
+        let plain_text = plain_sections.join("\n\n");
 
         Ok(ConversionResult {
             markdown,
+            plain_text,
             title,
             warnings,
             ..Default::default()
@@ -440,6 +446,66 @@ mod tests {
         // (it will be inside the fenced code block as part of print('hello') though)
         assert!(!result.markdown.contains("output_type"));
         assert!(!result.markdown.contains("stdout"));
+    }
+
+    #[test]
+    fn test_ipynb_plain_text_code_no_fences() {
+        let cells = vec![
+            make_cell("markdown", &["# Title"]),
+            make_cell("code", &["x = 1\ny = 2"]),
+        ];
+        let data = make_notebook(&cells, default_metadata());
+        let result = IpynbConverter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        // Plain text should NOT contain code fences
+        assert!(!result.plain_text.contains("```"));
+        assert!(result.plain_text.contains("x = 1\ny = 2"));
+        // Markdown cells appear as-is in plain text
+        assert!(result.plain_text.contains("# Title"));
+    }
+
+    #[test]
+    fn test_ipynb_plain_text_raw_no_fences() {
+        let cells = vec![make_cell("raw", &["raw data here"])];
+        let data = make_notebook(&cells, default_metadata());
+        let result = IpynbConverter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        assert!(!result.plain_text.contains("```"));
+        assert!(result.plain_text.contains("raw data here"));
+    }
+
+    #[test]
+    fn test_ipynb_plain_text_mixed_cells() {
+        let cells = vec![
+            make_cell("markdown", &["## Section"]),
+            make_cell("code", &["print('hello')"]),
+            make_cell("raw", &["raw content"]),
+        ];
+        let data = make_notebook(&cells, default_metadata());
+        let result = IpynbConverter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        let pt = &result.plain_text;
+        assert!(pt.contains("## Section"));
+        assert!(pt.contains("print('hello')"));
+        assert!(pt.contains("raw content"));
+        // Verify ordering
+        let section_pos = pt.find("## Section").unwrap();
+        let code_pos = pt.find("print('hello')").unwrap();
+        let raw_pos = pt.find("raw content").unwrap();
+        assert!(section_pos < code_pos);
+        assert!(code_pos < raw_pos);
+    }
+
+    #[test]
+    fn test_ipynb_plain_text_empty_notebook() {
+        let data = make_notebook(&[], default_metadata());
+        let result = IpynbConverter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        assert!(result.plain_text.is_empty());
     }
 
     #[test]

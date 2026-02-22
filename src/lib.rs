@@ -192,6 +192,7 @@ pub async fn convert_bytes_async(
                 if !pending.infos.is_empty() {
                     converter::ooxml_utils::resolve_image_placeholders_async(
                         &mut result.markdown,
+                        &mut result.plain_text,
                         &pending.infos,
                         &pending.bytes,
                         describer.as_ref(),
@@ -207,6 +208,7 @@ pub async fn convert_bytes_async(
                 if !pending.infos.is_empty() {
                     converter::ooxml_utils::resolve_image_placeholders_async(
                         &mut result.markdown,
+                        &mut result.plain_text,
                         &pending.infos,
                         &pending.bytes,
                         describer.as_ref(),
@@ -222,6 +224,7 @@ pub async fn convert_bytes_async(
                 if !pending.infos.is_empty() {
                     converter::ooxml_utils::resolve_image_placeholders_async(
                         &mut result.markdown,
+                        &mut result.plain_text,
                         &pending.infos,
                         &pending.bytes,
                         describer.as_ref(),
@@ -237,6 +240,7 @@ pub async fn convert_bytes_async(
                 if !pending.infos.is_empty() {
                     converter::ooxml_utils::resolve_image_placeholders_async(
                         &mut result.markdown,
+                        &mut result.plain_text,
                         &pending.infos,
                         &pending.bytes,
                         describer.as_ref(),

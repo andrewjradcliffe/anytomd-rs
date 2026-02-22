@@ -61,7 +61,7 @@ fn build_options(cli: &Cli) -> ConversionOptions {
 
 fn extract_output(result: &anytomd::ConversionResult, plain_text: bool) -> String {
     if plain_text {
-        result.plain_text()
+        result.plain_text.clone()
     } else {
         result.markdown.clone()
     }

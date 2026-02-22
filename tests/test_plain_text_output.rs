@@ -9,7 +9,7 @@ fn opts() -> ConversionOptions {
 fn test_plain_text_csv_no_table_markers() {
     let csv_data = b"Name,Age,City\nAlice,30,Seoul\nBob,25,Tokyo";
     let result = convert_bytes(csv_data, "csv", &opts()).unwrap();
-    let plain = result.plain_text();
+    let plain = result.plain_text.clone();
 
     // Content preserved
     assert!(plain.contains("Alice"), "missing Alice");
@@ -27,7 +27,7 @@ fn test_plain_text_csv_no_table_markers() {
 fn test_plain_text_html_no_markdown_markers() {
     let html = b"<html><body><h1>Title</h1><p>Hello <b>world</b></p></body></html>";
     let result = convert_bytes(html, "html", &opts()).unwrap();
-    let plain = result.plain_text();
+    let plain = result.plain_text.clone();
 
     assert!(plain.contains("Title"), "missing title");
     assert!(plain.contains("Hello"), "missing text");
@@ -40,7 +40,7 @@ fn test_plain_text_html_no_markdown_markers() {
 #[test]
 fn test_plain_text_docx_content_preserved() {
     let result = convert_file("tests/fixtures/sample.docx", &opts()).unwrap();
-    let plain = result.plain_text();
+    let plain = result.plain_text.clone();
 
     // Must contain some text
     assert!(!plain.trim().is_empty(), "plain text should not be empty");
@@ -56,7 +56,7 @@ fn test_plain_text_docx_content_preserved() {
 #[test]
 fn test_plain_text_xlsx_tab_separated() {
     let result = convert_file("tests/fixtures/sample.xlsx", &opts()).unwrap();
-    let plain = result.plain_text();
+    let plain = result.plain_text.clone();
 
     assert!(!plain.trim().is_empty(), "plain text should not be empty");
     assert!(!plain.contains("|---"), "table separator not stripped");
@@ -69,7 +69,7 @@ fn test_plain_text_xlsx_tab_separated() {
 fn test_plain_text_unicode_preserved() {
     let csv_data = "Name,City\n다영,서울\n太郎,東京\n🚀,🎉".as_bytes();
     let result = convert_bytes(csv_data, "csv", &opts()).unwrap();
-    let plain = result.plain_text();
+    let plain = result.plain_text.clone();
 
     assert!(plain.contains("다영"), "Korean not preserved");
     assert!(plain.contains("서울"), "Korean city not preserved");
@@ -84,7 +84,7 @@ fn test_plain_text_unicode_preserved() {
 fn test_plain_text_json_code_block_preserved() {
     let json_data = br#"{"name": "Alice", "age": 30}"#;
     let result = convert_bytes(json_data, "json", &opts()).unwrap();
-    let plain = result.plain_text();
+    let plain = result.plain_text.clone();
 
     assert!(plain.contains("\"name\""), "JSON key not preserved");
     assert!(plain.contains("\"Alice\""), "JSON value not preserved");
@@ -100,5 +100,5 @@ fn test_plain_text_file_vs_bytes_consistent() {
     let data = std::fs::read("tests/fixtures/sample.csv").unwrap();
     let result_bytes = convert_bytes(&data, "csv", &opts()).unwrap();
 
-    assert_eq!(result_file.plain_text(), result_bytes.plain_text());
+    assert_eq!(result_file.plain_text, result_bytes.plain_text);
 }

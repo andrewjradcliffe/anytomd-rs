@@ -64,9 +64,11 @@ impl Converter for XmlConverter {
 
         let pretty = prettify_xml(text)?;
         let markdown = format!("```xml\n{pretty}\n```\n");
+        let plain_text = format!("{pretty}\n");
 
         Ok(ConversionResult {
             markdown,
+            plain_text,
             ..Default::default()
         })
     }
@@ -252,6 +254,21 @@ mod tests {
         assert!(result.title.is_none());
         assert!(result.images.is_empty());
         assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_xml_plain_text_no_fences() {
+        let result = convert(b"<root><child>text</child></root>").unwrap();
+        assert!(!result.plain_text.contains("```"));
+        assert!(result.plain_text.contains("<root>"));
+        assert!(result.plain_text.contains("<child>text</child>"));
+    }
+
+    #[test]
+    fn test_xml_plain_text_pretty_printed() {
+        let result = convert(b"<root><a>val</a></root>").unwrap();
+        assert!(result.plain_text.contains("  <a>val</a>"));
+        assert!(!result.plain_text.contains("```"));
     }
 
     #[test]

@@ -140,18 +140,15 @@ pub struct ConversionOptions {
 pub struct ConversionResult {
     /// Converted Markdown content
     pub markdown: String,
+    /// Plain text extracted directly from the source document (no markdown syntax).
+    /// Each converter populates this alongside `markdown` during conversion.
+    pub plain_text: String,
     /// Document title (if detected)
     pub title: Option<String>,
     /// Extracted images as (filename, bytes) pairs
     pub images: Vec<(String, Vec<u8>)>,
     /// Recoverable issues encountered during conversion
     pub warnings: Vec<ConversionWarning>,
-}
-
-impl ConversionResult {
-    /// Returns the content as plain text with Markdown formatting removed.
-    /// Computed on demand via `strip_markdown()` — no extra storage.
-    pub fn plain_text(&self) -> String;
 }
 
 pub trait Converter {
@@ -234,9 +231,8 @@ for warning in &result.warnings {
     eprintln!("[{:?}] {}", warning.code, warning.message);
 }
 
-// Get plain text output (Markdown formatting stripped)
-let plain = result.plain_text();
-println!("{}", plain);
+// Get plain text output (extracted directly from source, no markdown syntax)
+println!("{}", result.plain_text);
 ```
 
 ### 3.4 Package and Crate Naming
@@ -593,21 +589,23 @@ To prevent unbounded memory usage on large documents:
 
 ### 6.5 Plain Text Output
 
-`ConversionResult::plain_text()` returns the Markdown content with all formatting stripped via `strip_markdown()`. This is a post-processing step — no converter changes are needed.
+`ConversionResult.plain_text` is populated by each converter directly from the source document during conversion (Approach A: Direct Extraction). This avoids the corruption that post-processing approaches (e.g., `strip_markdown()`) cause when source data contains markdown-like characters (e.g., `**kwargs` in Python docs, `# comment` in config files).
 
-**Stripping rules:**
-- Headings (`# text`): `#` prefix removed, text preserved
-- Bold/italic (`**text**`, `*text*`, `***text***`): markers removed
-- Tables: separator rows removed, data rows converted to tab-separated values with cell unescaping (`\|` → `|`, `\\` → `\`, `<br>` → newline)
-- Code blocks (`` ``` ``): fences removed, content preserved as-is (no inner stripping)
-- Lists (`- item`, `1. item`): markers removed, indentation preserved
-- Blockquotes (`> text`): `>` prefix removed
-- Links (`[text](url)`): URL removed, text preserved
-- Images (`![alt](url)`): URL removed, alt text preserved
-- Horizontal rules (`---`): removed
-- Checkboxes (`[x]`, `[ ]`): markers removed
-- Inline code (`` `code` ``): backticks removed
-- Consecutive blank lines: collapsed to at most one
+**Per-converter behavior:**
+
+| Converter | Plain text behavior |
+|-----------|-------------------|
+| Plain Text | Identical to markdown (decoded text passthrough) |
+| Code | Raw source code without fenced code block markers |
+| JSON | Pretty-printed JSON without code fences |
+| XML | Pretty-printed XML without code fences |
+| CSV | Tab-separated values (no pipes or separator rows) |
+| HTML | Text content only (no heading markers, bold/italic, link syntax) |
+| DOCX | Text content only (no heading markers, bold/italic, link syntax) |
+| PPTX | Slide content without `## Slide N:` prefixes, tab-separated tables |
+| XLSX | Sheet names without `##`, tab-separated tables |
+| Jupyter | Markdown cells as-is, code/raw cells without fenced code blocks |
+| Images | Alt text / LLM description only (no `![](...)` syntax) |
 
 **Use cases:** full-text search indexing (Tantivy), LLM preprocessing, text analytics.
 
@@ -799,7 +797,7 @@ fn test_gemini_live_describe_image() {
 - [x] Code file converter (fenced blocks with language detection)
 - [x] Plain text file converter (encoding detection)
 - [x] Jupyter Notebook converter
-- [x] Plain text output via `ConversionResult::plain_text()` and CLI `--plain-text`
+- [x] Plain text output via `ConversionResult.plain_text` field (direct extraction) and CLI `--plain-text`
 
 ### Future
 - [ ] PDF converter

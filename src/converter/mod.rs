@@ -111,23 +111,16 @@ impl Default for ConversionOptions {
 pub struct ConversionResult {
     /// Converted Markdown content.
     pub markdown: String,
+    /// Plain text content extracted directly from the source document,
+    /// without any Markdown formatting. Tables are tab-separated,
+    /// headings are just text, and code is raw content without fences.
+    pub plain_text: String,
     /// Document title, if detected.
     pub title: Option<String>,
     /// Extracted images as (filename, bytes) pairs.
     pub images: Vec<(String, Vec<u8>)>,
     /// Recoverable issues encountered during conversion.
     pub warnings: Vec<ConversionWarning>,
-}
-
-impl ConversionResult {
-    /// Returns the content as plain text with Markdown formatting removed.
-    ///
-    /// Headings, bold/italic markers, table syntax, code fences, list markers,
-    /// blockquote prefixes, links, and images are stripped. Code block content
-    /// is preserved as-is. Computed on demand — no extra memory stored.
-    pub fn plain_text(&self) -> String {
-        crate::markdown::strip_markdown(&self.markdown)
-    }
 }
 
 /// Decode raw bytes to a UTF-8 string, handling BOM detection and encoding fallback.
