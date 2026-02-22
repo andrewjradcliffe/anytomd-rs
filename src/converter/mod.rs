@@ -111,6 +111,10 @@ impl Default for ConversionOptions {
 pub struct ConversionResult {
     /// Converted Markdown content.
     pub markdown: String,
+    /// Plain text content extracted directly from the source document,
+    /// without any Markdown formatting. Tables are tab-separated,
+    /// headings are just text, and code is raw content without fences.
+    pub plain_text: String,
     /// Document title, if detected.
     pub title: Option<String>,
     /// Extracted images as (filename, bytes) pairs.

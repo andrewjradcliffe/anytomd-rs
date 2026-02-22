@@ -31,7 +31,7 @@ Do NOT translate Python line-by-line — understand the *intent*, then implement
 - XLSX: `calamine` — PDF: `pdf-extract`/`lopdf` — HTML: `scraper`
 - If no pure Rust solution exists, **implement in Rust** or **defer** — never add a non-Rust dependency
 
-**Output goal:** LLM-readable text extraction, not pixel-perfect Markdown. Simpler output that captures content is preferred. Must preserve Unicode (CJK, emoji) without corruption.
+**Output goal:** LLM-readable text extraction, not pixel-perfect Markdown. Simpler output that captures content is preferred. Must preserve Unicode (CJK, emoji) without corruption. `ConversionResult` provides both `.markdown` and `.plain_text` fields — each converter populates plain text directly from the source document (no post-processing).
 
 ---
 

@@ -81,6 +81,12 @@ anytomd --format html page.dat
 # Strict mode: treat recoverable errors as hard errors
 anytomd --strict document.docx
 
+# Plain text output (Markdown formatting stripped)
+anytomd --plain-text document.docx
+
+# Plain text from stdin
+echo "Name,Age" | anytomd --format csv --plain-text
+
 # Auto image descriptions (just set GEMINI_API_KEY)
 export GEMINI_API_KEY=your-key
 anytomd presentation.pptx
@@ -108,6 +114,22 @@ println!("{}", result.markdown);
 let csv_data = b"Name,Age\nAlice,30\nBob,25";
 let result = convert_bytes(csv_data, "csv", &options).unwrap();
 println!("{}", result.markdown);
+```
+
+### Plain Text Output
+
+Every conversion produces both Markdown and plain text output. The plain text is extracted directly from the source document — no post-processing or markdown stripping — so source characters like `**kwargs` or `# comment` are preserved exactly.
+
+```rust
+use anytomd::{convert_file, ConversionOptions};
+
+let result = convert_file("document.docx", &ConversionOptions::default()).unwrap();
+
+// Markdown output
+println!("{}", result.markdown);
+
+// Plain text output (no headings, bold, tables, code fences, etc.)
+println!("{}", result.plain_text);
 ```
 
 ### Extracting Embedded Images
@@ -255,6 +277,7 @@ pub async fn convert_bytes_async(
 ```rust
 pub struct ConversionResult {
     pub markdown: String,                  // The converted Markdown
+    pub plain_text: String,                // Plain text (extracted directly, no markdown syntax)
     pub title: Option<String>,             // Document title, if detected
     pub images: Vec<(String, Vec<u8>)>,    // Extracted images (filename, bytes)
     pub warnings: Vec<ConversionWarning>,  // Recoverable issues encountered

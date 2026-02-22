@@ -13,7 +13,7 @@ use crate::converter::{
     ConversionOptions, ConversionResult, ConversionWarning, Converter, WarningCode,
 };
 use crate::error::ConvertError;
-use crate::markdown::build_table;
+use crate::markdown::{build_table, build_table_plain};
 use crate::zip_utils::{read_zip_bytes, read_zip_text};
 
 pub struct PptxConverter;
@@ -714,14 +714,18 @@ fn resolve_notes_path(slide_rels: &HashMap<String, Relationship>) -> Option<Stri
 /// Images are emitted with unique placeholder alt text `__img_N__`.
 /// `image_counter` is incremented for each image to ensure uniqueness.
 /// Returns (markdown, image_infos).
+/// Render a slide into both markdown and plain text.
+///
+/// Returns `(markdown, plain_text, image_infos)`.
 fn render_slide(
     number: usize,
     shapes: &[ShapeContent],
     notes: &Option<String>,
     image_filenames: &HashMap<String, String>,
     image_counter: &mut usize,
-) -> (String, Vec<ImageInfo>) {
+) -> (String, String, Vec<ImageInfo>) {
     let mut out = String::new();
+    let mut plain = String::new();
     let mut image_infos: Vec<ImageInfo> = Vec::new();
 
     // Find the title
@@ -736,8 +740,10 @@ fn render_slide(
     // Slide heading
     if let Some(title_text) = title {
         out.push_str(&format!("## Slide {number}: {title_text}\n\n"));
+        plain.push_str(&format!("{title_text}\n\n"));
     } else {
         out.push_str(&format!("## Slide {number}\n\n"));
+        plain.push('\n');
     }
 
     // Body content, tables, and images (skip title since it's already in heading)
@@ -747,6 +753,8 @@ fn render_slide(
             ShapeContent::Body(text) => {
                 out.push_str(text);
                 out.push_str("\n\n");
+                plain.push_str(text);
+                plain.push_str("\n\n");
             }
             ShapeContent::Table { headers, rows } => {
                 let header_refs: Vec<&str> = headers.iter().map(|s| s.as_str()).collect();
@@ -756,6 +764,8 @@ fn render_slide(
                     .collect();
                 out.push_str(&build_table(&header_refs, &row_refs));
                 out.push('\n');
+                plain.push_str(&build_table_plain(&header_refs, &row_refs));
+                plain.push('\n');
             }
             ShapeContent::Image { rel_id, alt_text } => {
                 if let Some(filename) = image_filenames.get(rel_id) {
@@ -764,10 +774,12 @@ fn render_slide(
                     *image_counter += 1;
                     image_infos.push(ImageInfo {
                         placeholder: placeholder.clone(),
-                        original_alt,
+                        original_alt: original_alt.clone(),
                         filename: filename.clone(),
                     });
                     out.push_str(&format!("![{placeholder}]({filename})\n\n"));
+                    // Plain text: image description placeholder (resolved later)
+                    plain.push_str(&format!("{placeholder}\n\n"));
                 }
             }
         }
@@ -782,11 +794,18 @@ fn render_slide(
                 out.push_str(&format!("\n> {line}"));
             }
             out.push_str("\n\n");
+            // Plain text: notes without blockquote prefix
+            plain.push_str(notes_text);
+            plain.push_str("\n\n");
         }
     }
 
     // Trim trailing whitespace
-    (out.trim_end().to_string(), image_infos)
+    (
+        out.trim_end().to_string(),
+        plain.trim_end().to_string(),
+        image_infos,
+    )
 }
 
 // ---- Converter trait impl ----
@@ -839,6 +858,7 @@ impl PptxConverter {
 
         // 4. Process each slide — collect all image infos and bytes across slides
         let mut slide_markdowns: Vec<String> = Vec::new();
+        let mut slide_plains: Vec<String> = Vec::new();
         let mut document_title: Option<String> = None;
         let mut total_image_bytes: usize = 0;
         let mut image_counter: usize = 0;
@@ -927,7 +947,7 @@ impl PptxConverter {
                 });
             }
 
-            let (slide_md, slide_image_infos) = render_slide(
+            let (slide_md, slide_plain, slide_image_infos) = render_slide(
                 slide_info.number,
                 &shapes,
                 &notes,
@@ -937,9 +957,10 @@ impl PptxConverter {
 
             all_image_infos.extend(slide_image_infos);
             slide_markdowns.push(slide_md);
+            slide_plains.push(slide_plain);
         }
 
-        // Join slides with horizontal rule separator
+        // Join slides with horizontal rule separator (markdown) or blank line (plain text)
         let markdown = slide_markdowns.join("\n\n---\n\n");
         let markdown = if markdown.is_empty() {
             markdown
@@ -947,8 +968,16 @@ impl PptxConverter {
             format!("{markdown}\n")
         };
 
+        let plain_text = slide_plains.join("\n\n");
+        let plain_text = if plain_text.is_empty() {
+            plain_text
+        } else {
+            format!("{plain_text}\n")
+        };
+
         let result = ConversionResult {
             markdown,
+            plain_text,
             title: document_title,
             images,
             warnings,
@@ -978,6 +1007,7 @@ impl Converter for PptxConverter {
         let (mut result, pending) = self.convert_inner(data, options)?;
         resolve_image_placeholders(
             &mut result.markdown,
+            &mut result.plain_text,
             &pending.infos,
             &pending.bytes,
             options.image_describer.as_deref(),

@@ -61,6 +61,43 @@ pub fn format_heading(level: u8, text: &str) -> String {
     format!("{} {}\n", hashes, text)
 }
 
+/// Build a plain-text table from headers and rows.
+///
+/// Output is tab-separated values with no pipes, separators, or escaping.
+/// Each row (including headers) is on its own line.
+pub fn build_table_plain(headers: &[&str], rows: &[Vec<&str>]) -> String {
+    let col_count = headers.len();
+    if col_count == 0 {
+        return String::new();
+    }
+
+    let mut out = String::new();
+
+    // Header row: tab-separated
+    out.push_str(&headers.join("\t"));
+    out.push('\n');
+
+    // Data rows: tab-separated, padded to header count
+    for row in rows {
+        let mut cells: Vec<&str> = Vec::with_capacity(col_count);
+        for i in 0..col_count {
+            cells.push(row.get(i).copied().unwrap_or(""));
+        }
+        out.push_str(&cells.join("\t"));
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Format a plain-text list item with indentation but no marker.
+///
+/// `level` is 0-based indentation depth. No bullet or number is emitted.
+pub fn format_list_item_plain(level: u8, text: &str) -> String {
+    let indent = "  ".repeat(level as usize);
+    format!("{indent}{text}")
+}
+
 /// Wrap text with Markdown bold/italic markers.
 ///
 /// Leading and trailing whitespace is preserved outside the markers for clean output.
@@ -259,5 +296,58 @@ mod tests {
     fn test_build_table_newline_in_cell_replaced() {
         let result = build_table(&["A"], &[vec!["line1\nline2"]]);
         assert!(result.contains("| line1<br>line2 |"));
+    }
+
+    // --- build_table_plain tests ---
+
+    #[test]
+    fn test_build_table_plain_basic() {
+        let result = build_table_plain(&["A", "B"], &[vec!["1", "2"], vec!["3", "4"]]);
+        assert_eq!(result, "A\tB\n1\t2\n3\t4\n");
+    }
+
+    #[test]
+    fn test_build_table_plain_empty_headers() {
+        let result = build_table_plain(&[], &[vec!["x"]]);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_build_table_plain_short_rows_padded() {
+        let result = build_table_plain(&["A", "B", "C"], &[vec!["1"]]);
+        assert_eq!(result, "A\tB\tC\n1\t\t\n");
+    }
+
+    #[test]
+    fn test_build_table_plain_no_rows() {
+        let result = build_table_plain(&["X", "Y"], &[]);
+        assert_eq!(result, "X\tY\n");
+    }
+
+    #[test]
+    fn test_build_table_plain_pipes_preserved() {
+        // Pipes should NOT be escaped in plain text output
+        let result = build_table_plain(&["Cmd"], &[vec!["echo | grep"]]);
+        assert!(result.contains("echo | grep"));
+    }
+
+    #[test]
+    fn test_build_table_plain_unicode() {
+        let result = build_table_plain(&["이름", "도시"], &[vec!["다영", "서울"]]);
+        assert!(result.contains("이름\t도시"));
+        assert!(result.contains("다영\t서울"));
+    }
+
+    // --- format_list_item_plain tests ---
+
+    #[test]
+    fn test_format_list_item_plain_level_zero() {
+        assert_eq!(format_list_item_plain(0, "Item"), "Item");
+    }
+
+    #[test]
+    fn test_format_list_item_plain_nested() {
+        assert_eq!(format_list_item_plain(1, "Nested"), "  Nested");
+        assert_eq!(format_list_item_plain(2, "Deep"), "    Deep");
     }
 }

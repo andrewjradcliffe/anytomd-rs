@@ -27,9 +27,11 @@ impl Converter for JsonConverter {
             })?;
 
         let markdown = format!("```json\n{pretty}\n```\n");
+        let plain_text = format!("{pretty}\n");
 
         Ok(ConversionResult {
             markdown,
+            plain_text,
             ..Default::default()
         })
     }
@@ -164,6 +166,29 @@ mod tests {
         assert!(result.title.is_none());
         assert!(result.images.is_empty());
         assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_json_plain_text_no_fences() {
+        let converter = JsonConverter;
+        let input = br#"{"name": "Alice"}"#;
+        let result = converter
+            .convert(input, &ConversionOptions::default())
+            .unwrap();
+        assert!(!result.plain_text.contains("```"));
+        assert!(result.plain_text.contains("\"name\""));
+        assert!(result.plain_text.contains("\"Alice\""));
+    }
+
+    #[test]
+    fn test_json_plain_text_pretty_printed() {
+        let converter = JsonConverter;
+        let input = br#"{"a":1,"b":2}"#;
+        let result = converter
+            .convert(input, &ConversionOptions::default())
+            .unwrap();
+        assert!(result.plain_text.contains("  \"a\": 1"));
+        assert!(!result.plain_text.contains("```"));
     }
 
     #[test]

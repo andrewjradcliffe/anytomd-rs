@@ -1,6 +1,6 @@
 use crate::converter::{ConversionOptions, ConversionResult, Converter};
 use crate::error::ConvertError;
-use crate::markdown::build_table;
+use crate::markdown::{build_table, build_table_plain};
 
 pub struct CsvConverter;
 
@@ -62,6 +62,7 @@ impl Converter for CsvConverter {
             .map(|row| row.iter().map(|s| s.as_str()).collect())
             .collect();
         let markdown = build_table(&header_refs, &row_refs);
+        let plain_text = build_table_plain(&header_refs, &row_refs);
 
         let mut warnings = Vec::new();
         if let Some(w) = encoding_warning {
@@ -70,6 +71,7 @@ impl Converter for CsvConverter {
 
         Ok(ConversionResult {
             markdown,
+            plain_text,
             warnings,
             ..Default::default()
         })
@@ -221,6 +223,31 @@ mod tests {
             result.markdown
         );
         assert!(result.markdown.contains("grep h"));
+    }
+
+    #[test]
+    fn test_csv_plain_text_tab_separated() {
+        let converter = CsvConverter;
+        let input = b"Name,Age,City\nAlice,30,Seoul\nBob,25,Tokyo\n";
+        let result = converter
+            .convert(input, &ConversionOptions::default())
+            .unwrap();
+        assert!(result.plain_text.contains("Name\tAge\tCity"));
+        assert!(result.plain_text.contains("Alice\t30\tSeoul"));
+        assert!(result.plain_text.contains("Bob\t25\tTokyo"));
+        assert!(!result.plain_text.contains("|"));
+        assert!(!result.plain_text.contains("---"));
+    }
+
+    #[test]
+    fn test_csv_plain_text_pipe_in_cell_preserved() {
+        let converter = CsvConverter;
+        let input = b"Name,Command\nAlice,\"echo | grep\"\n";
+        let result = converter
+            .convert(input, &ConversionOptions::default())
+            .unwrap();
+        // In plain text, pipes should NOT be escaped
+        assert!(result.plain_text.contains("echo | grep"));
     }
 
     #[test]

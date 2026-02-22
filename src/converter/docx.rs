@@ -13,7 +13,10 @@ use crate::converter::{
     ConversionOptions, ConversionResult, ConversionWarning, Converter, WarningCode,
 };
 use crate::error::ConvertError;
-use crate::markdown::{build_table, format_heading, format_list_item, wrap_formatting};
+use crate::markdown::{
+    build_table, build_table_plain, format_heading, format_list_item, format_list_item_plain,
+    wrap_formatting,
+};
 use crate::zip_utils::{read_zip_bytes, read_zip_text};
 
 pub struct DocxConverter;
@@ -301,11 +304,20 @@ fn merge_and_format_runs(runs: &[RunSegment]) -> String {
     result
 }
 
+/// Concatenate run segments into plain text without any bold/italic formatting.
+fn merge_runs_plain(runs: &[RunSegment]) -> String {
+    let mut result = String::new();
+    for run in runs {
+        result.push_str(&run.text);
+    }
+    result
+}
+
 // ---- Document body parsing ----
 
-/// Parse the main document.xml body and produce Markdown output.
+/// Parse the main document.xml body and produce Markdown and plain text output.
 ///
-/// Returns (markdown, title, warnings, image_infos).
+/// Returns (markdown, plain_text, title, warnings, image_infos).
 /// Images are emitted with unique placeholder alt text `__img_N__`.
 /// `image_counter` is incremented for each image to ensure uniqueness.
 fn parse_document(
@@ -316,6 +328,7 @@ fn parse_document(
     image_counter: &mut usize,
 ) -> (
     String,
+    String,
     Option<String>,
     Vec<ConversionWarning>,
     Vec<ImageInfo>,
@@ -324,6 +337,7 @@ fn parse_document(
 
     let mut warnings = Vec::new();
     let mut output = String::new();
+    let mut plain_output = String::new();
     let mut title: Option<String> = None;
 
     // Paragraph-level state
@@ -331,6 +345,8 @@ fn parse_document(
     let mut in_paragraph = false;
     let mut current_para_kind = ParagraphKind::Normal;
     let mut current_para_runs: Vec<RunSegment> = Vec::new();
+    // Plain text counterpart: tracks text without markdown link/image syntax
+    let mut current_para_runs_plain: Vec<RunSegment> = Vec::new();
 
     // Run-level state
     let mut in_run = false;
@@ -345,6 +361,7 @@ fn parse_document(
     let mut in_hyperlink = false;
     let mut current_hyperlink_url: Option<String> = None;
     let mut hyperlink_runs: Vec<RunSegment> = Vec::new();
+    let mut hyperlink_runs_plain: Vec<RunSegment> = Vec::new();
 
     // Paragraph properties state (for list detection)
     let mut in_para_properties = false;
@@ -401,6 +418,7 @@ fn parse_document(
                         in_paragraph = true;
                         current_para_kind = ParagraphKind::Normal;
                         current_para_runs.clear();
+                        current_para_runs_plain.clear();
                         current_num_id = None;
                         current_ilvl = None;
                     }
@@ -446,6 +464,7 @@ fn parse_document(
                     "hyperlink" if in_paragraph => {
                         in_hyperlink = true;
                         hyperlink_runs.clear();
+                        hyperlink_runs_plain.clear();
                         current_hyperlink_url = None;
 
                         for attr in e.attributes().flatten() {
@@ -557,9 +576,11 @@ fn parse_document(
                             italic: false,
                         };
                         if in_hyperlink {
-                            hyperlink_runs.push(seg);
+                            hyperlink_runs.push(seg.clone());
+                            hyperlink_runs_plain.push(seg);
                         } else {
-                            current_para_runs.push(seg);
+                            current_para_runs.push(seg.clone());
+                            current_para_runs_plain.push(seg);
                         }
                     }
                     "hyperlink" if in_paragraph => {
@@ -598,9 +619,11 @@ fn parse_document(
                         italic: current_run_italic,
                     };
                     if in_hyperlink {
-                        hyperlink_runs.push(seg);
+                        hyperlink_runs.push(seg.clone());
+                        hyperlink_runs_plain.push(seg);
                     } else {
-                        current_para_runs.push(seg);
+                        current_para_runs.push(seg.clone());
+                        current_para_runs_plain.push(seg);
                     }
                 }
             }
@@ -624,6 +647,9 @@ fn parse_document(
                             let table_md = build_table(&headers, &data_rows);
                             output.push_str(&table_md);
                             output.push('\n');
+                            let table_plain = build_table_plain(&headers, &data_rows);
+                            plain_output.push_str(&table_plain);
+                            plain_output.push('\n');
                         }
                         in_table = false;
                         table_rows.clear();
@@ -651,8 +677,10 @@ fn parse_document(
                             };
                         }
 
-                        // Merge runs into final paragraph text
+                        // Merge runs into final paragraph text (markdown with formatting)
                         let current_para_text = merge_and_format_runs(&current_para_runs);
+                        // Plain text: no bold/italic markers, no link/image syntax
+                        let current_para_text_plain = merge_runs_plain(&current_para_runs_plain);
 
                         if in_table_cell {
                             // In a table cell: accumulate text
@@ -668,7 +696,9 @@ fn parse_document(
                             finalize_paragraph(
                                 &current_para_kind,
                                 &current_para_text,
+                                &current_para_text_plain,
                                 &mut output,
+                                &mut plain_output,
                                 &mut title,
                                 &mut list_counters,
                                 last_was_list,
@@ -677,6 +707,7 @@ fn parse_document(
                         }
                         in_paragraph = false;
                         current_para_runs.clear();
+                        current_para_runs_plain.clear();
                         current_num_id = None;
                         current_ilvl = None;
                     }
@@ -688,6 +719,7 @@ fn parse_document(
                     }
                     "hyperlink" if in_hyperlink => {
                         let link_text = merge_and_format_runs(&hyperlink_runs);
+                        let link_text_plain = merge_runs_plain(&hyperlink_runs_plain);
                         let link_md = if let Some(ref url) = current_hyperlink_url {
                             format!("[{}]({})", link_text, url)
                         } else {
@@ -698,8 +730,15 @@ fn parse_document(
                             bold: false,
                             italic: false,
                         });
+                        // Plain text: just the link text, no URL
+                        current_para_runs_plain.push(RunSegment {
+                            text: link_text_plain,
+                            bold: false,
+                            italic: false,
+                        });
                         in_hyperlink = false;
                         hyperlink_runs.clear();
+                        hyperlink_runs_plain.clear();
                         current_hyperlink_url = None;
                     }
                     "rPr" => {
@@ -741,10 +780,18 @@ fn parse_document(
                                     bold: false,
                                     italic: false,
                                 };
+                                // Plain text: just the placeholder (no image markdown syntax)
+                                let seg_plain = RunSegment {
+                                    text: placeholder,
+                                    bold: false,
+                                    italic: false,
+                                };
                                 if in_hyperlink {
                                     hyperlink_runs.push(seg);
+                                    hyperlink_runs_plain.push(seg_plain);
                                 } else {
                                     current_para_runs.push(seg);
+                                    current_para_runs_plain.push(seg_plain);
                                 }
                             } else {
                                 warnings.push(ConversionWarning {
@@ -777,7 +824,14 @@ fn parse_document(
         format!("{}\n", markdown)
     };
 
-    (markdown, title, warnings, image_infos)
+    let plain_text = plain_output.trim_end().to_string();
+    let plain_text = if plain_text.is_empty() {
+        plain_text
+    } else {
+        format!("{}\n", plain_text)
+    };
+
+    (markdown, plain_text, title, warnings, image_infos)
 }
 
 /// Check if a `w:val` attribute on an element is explicitly false ("0" or "false").
@@ -825,16 +879,20 @@ fn resolve_hyperlink_url(
     }
 }
 
-/// Finalize a paragraph: emit heading, list item, or plain text into the output buffer.
+/// Finalize a paragraph: emit heading, list item, or plain text into the output buffers.
+#[allow(clippy::too_many_arguments)]
 fn finalize_paragraph(
     kind: &ParagraphKind,
     text: &str,
+    text_plain: &str,
     output: &mut String,
+    plain_output: &mut String,
     title: &mut Option<String>,
     list_counters: &mut HashMap<(String, u8), usize>,
     last_was_list: bool,
 ) {
     let trimmed = text.trim();
+    let trimmed_plain = text_plain.trim();
     if trimmed.is_empty() {
         return;
     }
@@ -843,9 +901,13 @@ fn finalize_paragraph(
         ParagraphKind::Heading(level) => {
             if last_was_list {
                 output.push('\n');
+                plain_output.push('\n');
             }
             output.push_str(&format_heading(*level, trimmed));
             output.push('\n');
+            // Plain text: just the text, no # markers
+            plain_output.push_str(trimmed_plain);
+            plain_output.push_str("\n\n");
             if *level == 1 && title.is_none() {
                 *title = Some(trimmed.to_string());
             }
@@ -866,13 +928,20 @@ fn finalize_paragraph(
             let item = format_list_item(*level, *ordered, counter, trimmed);
             output.push_str(&item);
             output.push('\n');
+            // Plain text: indented text without bullet/number markers
+            let item_plain = format_list_item_plain(*level, trimmed_plain);
+            plain_output.push_str(&item_plain);
+            plain_output.push('\n');
         }
         ParagraphKind::Normal => {
             if last_was_list {
                 output.push('\n');
+                plain_output.push('\n');
             }
             output.push_str(trimmed);
             output.push_str("\n\n");
+            plain_output.push_str(trimmed_plain);
+            plain_output.push_str("\n\n");
         }
     }
 }
@@ -920,7 +989,7 @@ impl DocxConverter {
         })?;
 
         let mut image_counter: usize = 0;
-        let (markdown, title, mut warnings, image_infos) = parse_document(
+        let (markdown, plain_text, title, mut warnings, image_infos) = parse_document(
             &document_xml,
             &styles,
             &relationships,
@@ -971,6 +1040,7 @@ impl DocxConverter {
 
         let result = ConversionResult {
             markdown,
+            plain_text,
             title,
             images,
             warnings,
@@ -1000,6 +1070,7 @@ impl Converter for DocxConverter {
         let (mut result, pending) = self.convert_inner(data, options)?;
         resolve_image_placeholders(
             &mut result.markdown,
+            &mut result.plain_text,
             &pending.infos,
             &pending.bytes,
             options.image_describer.as_deref(),
@@ -2181,5 +2252,194 @@ mod tests {
                     && w.message.contains("image description failed")),
             "expected SkippedElement warning for image description failure"
         );
+    }
+
+    // ---- Plain text output tests ----
+
+    #[test]
+    fn test_docx_plain_text_paragraphs_and_headings() {
+        let body = format!(
+            "{}{}{}",
+            heading_para("My Title", 1),
+            para("Normal paragraph."),
+            heading_para("Section", 2),
+        );
+        let doc = wrap_body(&body);
+        let data = build_test_docx(&doc, None, None);
+        let converter = DocxConverter;
+        let result = converter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        // Markdown should have # markers
+        assert!(result.markdown.contains("# My Title"));
+        assert!(result.markdown.contains("## Section"));
+        // Plain text: no # markers, just text
+        assert!(
+            !result.plain_text.contains('#'),
+            "plain_text should not contain # heading markers, was: {}",
+            result.plain_text
+        );
+        assert!(
+            result.plain_text.contains("My Title"),
+            "plain_text should contain heading text, was: {}",
+            result.plain_text
+        );
+        assert!(
+            result.plain_text.contains("Normal paragraph."),
+            "plain_text should contain paragraph text, was: {}",
+            result.plain_text
+        );
+        assert!(
+            result.plain_text.contains("Section"),
+            "plain_text should contain second heading text, was: {}",
+            result.plain_text
+        );
+    }
+
+    #[test]
+    fn test_docx_plain_text_no_bold_italic_markers() {
+        let body = format!(
+            "{}{}{}",
+            bold_para("Bold text"),
+            italic_para("Italic text"),
+            bold_italic_para("Both"),
+        );
+        let doc = wrap_body(&body);
+        let data = build_test_docx(&doc, None, None);
+        let converter = DocxConverter;
+        let result = converter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        // Markdown has formatting markers
+        assert!(result.markdown.contains("**Bold text**"));
+        assert!(result.markdown.contains("*Italic text*"));
+        assert!(result.markdown.contains("***Both***"));
+        // Plain text: no * markers at all
+        assert!(
+            !result.plain_text.contains('*'),
+            "plain_text should not contain * markers, was: {}",
+            result.plain_text
+        );
+        assert!(result.plain_text.contains("Bold text"));
+        assert!(result.plain_text.contains("Italic text"));
+        assert!(result.plain_text.contains("Both"));
+    }
+
+    #[test]
+    fn test_docx_plain_text_hyperlink_no_markdown_syntax() {
+        let body = r#"<w:p><w:hyperlink r:id="rId1"><w:r><w:t>Example Link</w:t></w:r></w:hyperlink></w:p>"#;
+        let doc = wrap_body(body);
+        let rels = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com" TargetMode="External"/></Relationships>"#;
+        let data = build_test_docx(&doc, None, Some(rels));
+        let converter = DocxConverter;
+        let result = converter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        // Markdown has link syntax
+        assert!(
+            result
+                .markdown
+                .contains("[Example Link](https://example.com)")
+        );
+        // Plain text: just the text, no brackets or URL
+        assert!(
+            result.plain_text.contains("Example Link"),
+            "plain_text should contain link text, was: {}",
+            result.plain_text
+        );
+        assert!(
+            !result.plain_text.contains('['),
+            "plain_text should not contain [ bracket, was: {}",
+            result.plain_text
+        );
+        assert!(
+            !result.plain_text.contains("https://example.com"),
+            "plain_text should not contain URL, was: {}",
+            result.plain_text
+        );
+    }
+
+    #[test]
+    fn test_docx_plain_text_table_tab_separated() {
+        let body = r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>H1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>H2</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+        let doc = wrap_body(body);
+        let data = build_test_docx(&doc, None, None);
+        let converter = DocxConverter;
+        let result = converter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        // Markdown has pipe-delimited table
+        assert!(result.markdown.contains("| H1 | H2 |"));
+        assert!(result.markdown.contains("|---|---|"));
+        // Plain text: tab-separated, no pipes or separator row
+        assert!(
+            result.plain_text.contains("H1\tH2"),
+            "plain_text should have tab-separated headers, was: {}",
+            result.plain_text
+        );
+        assert!(
+            result.plain_text.contains("A\tB"),
+            "plain_text should have tab-separated data, was: {}",
+            result.plain_text
+        );
+        assert!(
+            !result.plain_text.contains('|'),
+            "plain_text should not contain pipe characters, was: {}",
+            result.plain_text
+        );
+        assert!(
+            !result.plain_text.contains("---"),
+            "plain_text should not contain separator row, was: {}",
+            result.plain_text
+        );
+    }
+
+    #[test]
+    fn test_docx_plain_text_image_no_markdown_syntax() {
+        let body = r#"<w:p><w:r><w:drawing><wp:inline><wp:docPr descr="A photo"/><a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip r:embed="rId2"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#;
+        let doc = wrap_body(body);
+        let rels = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/photo.jpg"/></Relationships>"#;
+        let data = build_test_docx(&doc, None, Some(rels));
+        let converter = DocxConverter;
+        let result = converter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        // Markdown has image syntax: ![alt](filename)
+        assert!(result.markdown.contains("photo.jpg"));
+        assert!(result.markdown.contains("!["));
+        // Plain text: just the placeholder, no ![] or () syntax
+        assert!(
+            !result.plain_text.contains("!["),
+            "plain_text should not contain ![ image syntax, was: {}",
+            result.plain_text
+        );
+        assert!(
+            !result.plain_text.contains("photo.jpg"),
+            "plain_text should not contain image filename, was: {}",
+            result.plain_text
+        );
+    }
+
+    #[test]
+    fn test_docx_plain_text_list_no_markers() {
+        let numbering = r#"<?xml version="1.0" encoding="UTF-8"?><w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#;
+        let body = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>Item 1</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>Item 2</w:t></w:r></w:p>"#;
+        let doc = wrap_body(body);
+        let data = build_test_docx_with_numbering(&doc, None, None, Some(numbering));
+        let converter = DocxConverter;
+        let result = converter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        // Markdown has bullet markers
+        assert!(result.markdown.contains("- Item 1"));
+        assert!(result.markdown.contains("- Item 2"));
+        // Plain text: no bullet markers
+        assert!(
+            !result.plain_text.contains("- "),
+            "plain_text should not contain bullet markers, was: {}",
+            result.plain_text
+        );
+        assert!(result.plain_text.contains("Item 1"));
+        assert!(result.plain_text.contains("Item 2"));
     }
 }

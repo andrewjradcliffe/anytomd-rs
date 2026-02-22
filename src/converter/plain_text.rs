@@ -21,8 +21,10 @@ impl Converter for PlainTextConverter {
         if let Some(w) = warning {
             warnings.push(w);
         }
+        let plain_text = text.clone();
         Ok(ConversionResult {
             markdown: text,
+            plain_text,
             warnings,
             ..Default::default()
         })
@@ -41,6 +43,17 @@ mod tests {
             .convert(input, &ConversionOptions::default())
             .unwrap();
         assert_eq!(result.markdown, "Hello, world!");
+        assert_eq!(result.plain_text, "Hello, world!");
+    }
+
+    #[test]
+    fn test_plain_text_field_equals_markdown() {
+        let converter = PlainTextConverter;
+        let input = b"Line 1\nLine 2\n";
+        let result = converter
+            .convert(input, &ConversionOptions::default())
+            .unwrap();
+        assert_eq!(result.plain_text, result.markdown);
     }
 
     #[test]
