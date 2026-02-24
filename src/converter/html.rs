@@ -1,3 +1,9 @@
+//! HTML to Markdown converter.
+//!
+//! Parses HTML using the `scraper` crate (html5ever) and walks the DOM tree
+//! to produce Markdown. Supports headings, paragraphs, tables, lists, links,
+//! blockquotes, code blocks, bold/italic, and images.
+
 use crate::converter::{ConversionOptions, ConversionResult, Converter};
 use crate::error::ConvertError;
 use crate::markdown;
@@ -5,6 +11,7 @@ use crate::markdown;
 use ego_tree::iter::Edge;
 use scraper::{Html, Node};
 
+/// Converts HTML files to Markdown.
 pub struct HtmlConverter;
 
 impl Converter for HtmlConverter {

@@ -1,3 +1,10 @@
+//! XLSX/XLS spreadsheet to Markdown converter.
+//!
+//! Uses the `calamine` crate to read both modern `.xlsx` (OOXML) and legacy
+//! `.xls` (BIFF) formats. Each sheet becomes a `## SheetName` section with
+//! a Markdown table. Handles dates, times, formulas, error cells, and
+//! embedded images.
+
 use std::collections::HashMap;
 use std::io::Cursor;
 
@@ -17,6 +24,7 @@ use crate::error::ConvertError;
 use crate::markdown::{build_table, build_table_plain, format_heading};
 use crate::zip_utils::{read_zip_bytes, read_zip_text};
 
+/// Converts XLSX and XLS spreadsheet files to Markdown.
 pub struct XlsxConverter;
 
 /// Extract embedded images for a given sheet by following the OOXML relationship chain:

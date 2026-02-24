@@ -1,3 +1,9 @@
+//! Shared Markdown generation utilities.
+//!
+//! Provides helpers for building Markdown tables, formatting headings,
+//! wrapping text with bold/italic markers, and generating list items.
+//! Also includes plain-text equivalents for the `plain_text` output path.
+
 /// Escape special characters in a table cell so that pipes, backslashes,
 /// and newlines do not break Markdown table structure.
 fn escape_cell(content: &str) -> String {

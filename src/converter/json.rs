@@ -1,6 +1,11 @@
+//! JSON to Markdown converter.
+//!
+//! Pretty-prints JSON content inside a fenced code block with `json` syntax highlighting.
+
 use crate::converter::{ConversionOptions, ConversionResult, Converter};
 use crate::error::ConvertError;
 
+/// Converts JSON files to Markdown fenced code blocks.
 pub struct JsonConverter;
 
 impl Converter for JsonConverter {

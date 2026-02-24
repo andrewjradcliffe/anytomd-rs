@@ -1,3 +1,9 @@
+//! PPTX (Office Open XML Presentation) to Markdown converter.
+//!
+//! Parses PPTX files directly from their OOXML ZIP structure. Extracts slide titles,
+//! body text, tables, speaker notes, and embedded images. Each slide becomes a
+//! `## Slide N: Title` section separated by horizontal rules.
+
 use std::collections::HashMap;
 use std::io::Cursor;
 
@@ -16,6 +22,7 @@ use crate::error::ConvertError;
 use crate::markdown::{build_table, build_table_plain};
 use crate::zip_utils::{read_zip_bytes, read_zip_text};
 
+/// Converts PPTX files to Markdown.
 pub struct PptxConverter;
 
 // ---- Data types ----

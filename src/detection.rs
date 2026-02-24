@@ -1,3 +1,9 @@
+//! File format detection by magic bytes, file extension, and ZIP introspection.
+//!
+//! Detection follows a strict priority order: magic bytes first, then container
+//! introspection (for ZIP-based formats), then file extension. This ensures
+//! that misnamed files are handled correctly.
+
 use std::path::Path;
 
 /// Magic bytes signatures for supported formats.

@@ -1,9 +1,14 @@
+//! XML to Markdown converter.
+//!
+//! Pretty-prints XML content inside a fenced code block with `xml` syntax highlighting.
+
 use crate::converter::{ConversionOptions, ConversionResult, Converter};
 use crate::error::ConvertError;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use quick_xml::writer::Writer;
 
+/// Converts XML files to Markdown fenced code blocks.
 pub struct XmlConverter;
 
 /// Strip UTF-8 BOM (EF BB BF) from the beginning of the text if present.

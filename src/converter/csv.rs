@@ -1,7 +1,13 @@
+//! CSV to Markdown table converter.
+//!
+//! Parses CSV data using the `csv` crate and renders it as a pipe-delimited
+//! Markdown table. The first row is treated as the header.
+
 use crate::converter::{ConversionOptions, ConversionResult, Converter};
 use crate::error::ConvertError;
 use crate::markdown::{build_table, build_table_plain};
 
+/// Converts CSV files to Markdown tables.
 pub struct CsvConverter;
 
 impl Converter for CsvConverter {

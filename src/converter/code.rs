@@ -1,6 +1,12 @@
+//! Source code file to Markdown converter.
+//!
+//! Wraps source code in a fenced code block with the appropriate language
+//! identifier derived from the file extension.
+
 use crate::converter::{ConversionOptions, ConversionResult, Converter};
 use crate::error::ConvertError;
 
+/// Converts source code files to Markdown fenced code blocks.
 pub struct CodeConverter;
 
 /// Map a file extension to its fenced code block language identifier.

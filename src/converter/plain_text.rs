@@ -1,6 +1,13 @@
+//! Plain text passthrough converter.
+//!
+//! Handles `.txt`, `.md`, `.rst`, `.log`, `.toml`, `.yaml`, `.ini`, and similar
+//! text-based formats. Detects encoding (UTF-8, UTF-16, Windows-1252) and
+//! passes the decoded text through as-is.
+
 use crate::converter::{ConversionOptions, ConversionResult, Converter};
 use crate::error::ConvertError;
 
+/// Converts plain text files to Markdown (passthrough with encoding detection).
 pub struct PlainTextConverter;
 
 impl Converter for PlainTextConverter {
