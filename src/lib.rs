@@ -1,3 +1,49 @@
+#![warn(missing_docs)]
+//! # anytomd
+//!
+//! A pure Rust library that converts various document formats into Markdown,
+//! designed for LLM consumption.
+//!
+//! # Supported Formats
+//!
+//! | Format | Extensions |
+//! |--------|-----------|
+//! | DOCX | `.docx` |
+//! | PPTX | `.pptx` |
+//! | XLSX | `.xlsx` |
+//! | XLS | `.xls` |
+//! | HTML | `.html`, `.htm` |
+//! | CSV | `.csv` |
+//! | Jupyter Notebook | `.ipynb` |
+//! | JSON | `.json` |
+//! | XML | `.xml` |
+//! | Images | `.png`, `.jpg`, `.gif`, `.webp`, `.bmp`, `.tiff`, `.svg`, `.heic`, `.avif` |
+//! | Code | `.py`, `.rs`, `.js`, `.ts`, `.c`, `.cpp`, `.go`, `.java`, and more |
+//! | Plain Text | `.txt`, `.md`, `.rst`, `.log`, `.toml`, `.yaml`, `.ini`, etc. |
+//!
+//! # Quick Start
+//!
+//! ```no_run
+//! use anytomd::{convert_file, convert_bytes, ConversionOptions};
+//!
+//! // Convert a file (format auto-detected from extension and magic bytes)
+//! let options = ConversionOptions::default();
+//! let result = convert_file("document.docx", &options).unwrap();
+//! println!("{}", result.markdown);
+//!
+//! // Convert raw bytes with an explicit format
+//! let csv_data = b"Name,Age\nAlice,30\nBob,25";
+//! let result = convert_bytes(csv_data, "csv", &options).unwrap();
+//! println!("{}", result.markdown);
+//! ```
+//!
+//! # Feature Flags
+//!
+//! | Feature | Description |
+//! |---------|-------------|
+//! | `async` | Async API: `convert_file_async`, `convert_bytes_async`, `AsyncImageDescriber` |
+//! | `async-gemini` | `AsyncGeminiDescriber` for concurrent Gemini API calls |
+
 pub mod converter;
 pub mod detection;
 pub mod error;
@@ -11,6 +57,10 @@ pub use converter::{
 };
 pub use error::ConvertError;
 
+/// Built-in Google Gemini image description providers.
+///
+/// Contains `GeminiDescriber` (sync, always available)
+/// and `AsyncGeminiDescriber` (behind the `async-gemini` feature).
 pub mod gemini {
     pub use crate::converter::gemini::GeminiDescriber;
 

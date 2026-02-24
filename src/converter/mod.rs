@@ -1,3 +1,9 @@
+//! Document format converters and shared conversion types.
+//!
+//! Each submodule implements the [`Converter`] trait for a specific format.
+//! The public types ([`ConversionOptions`], [`ConversionResult`], [`ConversionWarning`])
+//! are re-exported from the crate root.
+
 pub mod code;
 pub mod csv;
 pub mod docx;
@@ -41,19 +47,33 @@ pub trait ImageDescriber: Send + Sync {
 }
 
 /// Categories for recoverable conversion warnings.
+///
+/// Used in [`ConversionWarning`] to classify the type of issue encountered
+/// during best-effort conversion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WarningCode {
+    /// A document element was skipped because it could not be parsed.
     SkippedElement,
+    /// The document uses a feature not yet supported by this converter.
     UnsupportedFeature,
+    /// A resource limit was reached (e.g., max image bytes exceeded).
     ResourceLimitReached,
+    /// Part of the document was malformed but conversion continued.
     MalformedSegment,
 }
 
 /// A recoverable issue encountered during conversion.
+///
+/// Warnings are collected in [`ConversionResult::warnings`] when the converter
+/// encounters problems but can continue processing the rest of the document.
+/// In strict mode ([`ConversionOptions::strict`] = `true`), these become errors instead.
 #[derive(Debug, Clone)]
 pub struct ConversionWarning {
+    /// The category of this warning.
     pub code: WarningCode,
+    /// Human-readable description of what went wrong.
     pub message: String,
+    /// Where in the document the issue occurred (e.g., "Sheet1, row 5").
     pub location: Option<String>,
 }
 

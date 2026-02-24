@@ -1,3 +1,8 @@
+//! Google Gemini image description providers.
+//!
+//! Contains [`GeminiDescriber`] (sync, always available) and
+//! `AsyncGeminiDescriber` (behind the `async-gemini` feature).
+
 use crate::converter::ImageDescriber;
 use crate::error::ConvertError;
 

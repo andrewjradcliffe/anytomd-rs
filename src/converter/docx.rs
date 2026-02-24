@@ -1,3 +1,9 @@
+//! DOCX (Office Open XML) to Markdown converter.
+//!
+//! Parses DOCX files directly from their OOXML ZIP structure using `zip` + `quick-xml`,
+//! without intermediate HTML conversion. Extracts headings, paragraphs, tables,
+//! bold/italic, hyperlinks, lists, and embedded images.
+
 use std::collections::HashMap;
 use std::io::Cursor;
 
@@ -19,6 +25,7 @@ use crate::markdown::{
 };
 use crate::zip_utils::{read_zip_bytes, read_zip_text};
 
+/// Converts DOCX files to Markdown.
 pub struct DocxConverter;
 
 // ---- Data types ----

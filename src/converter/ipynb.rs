@@ -1,8 +1,14 @@
+//! Jupyter Notebook (`.ipynb`) to Markdown converter.
+//!
+//! Preserves markdown cells as-is and wraps code cells in fenced code blocks
+//! with language detection from notebook metadata.
+
 use crate::converter::{
     ConversionOptions, ConversionResult, ConversionWarning, Converter, WarningCode,
 };
 use crate::error::ConvertError;
 
+/// Converts Jupyter Notebook files to Markdown.
 pub struct IpynbConverter;
 
 impl Converter for IpynbConverter {

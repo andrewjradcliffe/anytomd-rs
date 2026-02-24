@@ -1,3 +1,9 @@
+//! Image file to Markdown converter.
+//!
+//! Produces a Markdown image reference with optional LLM-generated alt text
+//! via the [`ImageDescriber`](crate::ImageDescriber) trait. Supports PNG, JPEG,
+//! GIF, WebP, BMP, TIFF, SVG, HEIC, and AVIF.
+
 use std::collections::HashMap;
 
 use crate::converter::ooxml_utils::{
@@ -8,6 +14,7 @@ use crate::converter::{
 };
 use crate::error::ConvertError;
 
+/// Converts standalone image files to Markdown.
 pub struct ImageConverter;
 
 /// Derive a file extension from a MIME type string.
