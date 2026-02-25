@@ -118,12 +118,10 @@ fn parse_styles(xml: &str) -> HashMap<String, u8> {
 /// Extract heading level from a style ID like "Heading1", "Heading2", etc.
 fn extract_heading_level_from_id(style_id: &str) -> Option<u8> {
     let lower = style_id.to_ascii_lowercase();
-    if lower.starts_with("heading") {
-        let rest = &style_id[7..];
-        rest.parse::<u8>().ok().filter(|&l| (1..=9).contains(&l))
-    } else {
-        None
-    }
+    lower
+        .strip_prefix("heading")
+        .and_then(|rest| rest.parse::<u8>().ok())
+        .filter(|&l| (1..=9).contains(&l))
 }
 
 /// Extract heading level from a style name like "heading 1", "Heading 2", etc.

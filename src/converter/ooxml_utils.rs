@@ -102,7 +102,9 @@ pub(crate) fn resolve_relative_path(base_dir: &str, target: &str) -> String {
 
     let mut remaining = target;
     while let Some(rest) = remaining.strip_prefix("../") {
-        parts.pop();
+        if parts.pop().is_none() {
+            break;
+        }
         remaining = rest;
     }
 
@@ -136,7 +138,9 @@ pub(crate) fn resolve_relative_to_file(base_file: &str, target: &str) -> String 
 
     let mut target_remaining = target;
     while let Some(rest) = target_remaining.strip_prefix("../") {
-        base_parts.pop();
+        if base_parts.pop().is_none() {
+            break;
+        }
         target_remaining = rest;
     }
 
@@ -379,6 +383,36 @@ mod tests {
         assert_eq!(
             resolve_relative_to_file("slide.xml", "image1.png"),
             "image1.png"
+        );
+    }
+
+    #[test]
+    fn test_resolve_relative_path_excessive_parent_stops_at_root() {
+        // base "a" has 1 segment. "../../etc/passwd" tries 2 levels up.
+        // First "../" pops "a"; second "../" finds empty vec and breaks.
+        // The unresolved "../etc/passwd" remains as-is.
+        assert_eq!(
+            resolve_relative_path("a", "../../etc/passwd"),
+            "../etc/passwd"
+        );
+    }
+
+    #[test]
+    fn test_resolve_relative_to_file_excessive_parent_stops_at_root() {
+        // base_file "a/b.xml" → directory segments: ["a"].
+        // First "../" pops "a"; second "../" finds empty vec and breaks.
+        assert_eq!(
+            resolve_relative_to_file("a/b.xml", "../../etc/passwd"),
+            "../etc/passwd"
+        );
+    }
+
+    #[test]
+    fn test_resolve_relative_path_exact_parent_count() {
+        // Exactly matching "../" count should resolve cleanly
+        assert_eq!(
+            resolve_relative_path("a/b", "../media/image.png"),
+            "a/media/image.png"
         );
     }
 
