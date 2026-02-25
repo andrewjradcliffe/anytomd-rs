@@ -17,6 +17,12 @@ fn strip_bom(text: &str) -> &str {
 }
 
 /// Pretty-print XML with 2-space indentation using quick-xml's Reader/Writer.
+///
+/// # Security
+///
+/// `quick-xml` does not include a DTD parser and does not expand entity
+/// references, so XML entity expansion attacks (e.g. billion laughs) are
+/// inherently impossible with this reader.
 fn prettify_xml(input: &str) -> Result<String, ConvertError> {
     let mut reader = Reader::from_str(input);
     reader.config_mut().trim_text_start = true;

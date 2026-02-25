@@ -20,7 +20,7 @@ pub(crate) fn validate_zip_budget<R: Read + Seek>(
     }
     if total > budget as u64 {
         return Err(ConvertError::InputTooLarge {
-            size: total as usize,
+            size: (total).min(usize::MAX as u64) as usize,
             limit: budget,
         });
     }
@@ -125,5 +125,20 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(format!("{err}").contains("exceeds limit"));
+    }
+
+    #[test]
+    fn test_validate_zip_budget_exceeded_reports_correct_size() {
+        let big = vec![0u8; 500];
+        let data = build_test_zip(&[("big.bin", &big)]);
+        let mut archive = ZipArchive::new(Cursor::new(data.as_slice())).unwrap();
+        let result = validate_zip_budget(&mut archive, 100);
+        match result.unwrap_err() {
+            ConvertError::InputTooLarge { size, limit } => {
+                assert_eq!(limit, 100);
+                assert!(size >= 500, "reported size should be >= 500, got {size}");
+            }
+            other => panic!("expected InputTooLarge, got {other:?}"),
+        }
     }
 }
