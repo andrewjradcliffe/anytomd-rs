@@ -576,4 +576,24 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_convert_file_unknown_ext_json_with_utf8_bom() {
+        let dir = std::env::temp_dir().join("anytomd_test_json_bom_detect");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("payload.dat");
+        let mut data = vec![0xEF, 0xBB, 0xBF];
+        data.extend_from_slice(br#"{"k":1}"#);
+        std::fs::write(&file_path, data).unwrap();
+
+        let result = convert_file(&file_path, &ConversionOptions::default()).unwrap();
+        assert!(
+            result.markdown.contains("\"k\""),
+            "expected JSON conversion, markdown was: {}",
+            result.markdown
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -18,7 +18,10 @@ impl Converter for JsonConverter {
         data: &[u8],
         _options: &ConversionOptions,
     ) -> Result<ConversionResult, ConvertError> {
-        let text = String::from_utf8(data.to_vec())?;
+        let mut text = String::from_utf8(data.to_vec())?;
+        if let Some(stripped) = text.strip_prefix('\u{feff}') {
+            text = stripped.to_string();
+        }
 
         // Parse and re-serialize for pretty-printing
         let value: serde_json::Value =
@@ -202,5 +205,17 @@ mod tests {
         let input = vec![0xFF, 0xFE];
         let result = converter.convert(&input, &ConversionOptions::default());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_json_utf8_bom_is_accepted() {
+        let converter = JsonConverter;
+        let mut input = vec![0xEF, 0xBB, 0xBF];
+        input.extend_from_slice(br#"{"k":1}"#);
+        let result = converter
+            .convert(&input, &ConversionOptions::default())
+            .unwrap();
+        assert!(result.markdown.contains("\"k\""));
+        assert!(result.markdown.contains("1"));
     }
 }
