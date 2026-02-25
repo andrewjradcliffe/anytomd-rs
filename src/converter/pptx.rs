@@ -1,8 +1,9 @@
 //! PPTX (Office Open XML Presentation) to Markdown converter.
 //!
 //! Parses PPTX files directly from their OOXML ZIP structure. Extracts slide titles,
-//! body text, tables, speaker notes, and embedded images. Each slide becomes a
-//! `## Slide N: Title` section separated by horizontal rules.
+//! body text, tables, speaker notes, embedded images, and content from group shapes
+//! (`<p:grpSp>`). Each slide becomes a `## Slide N: Title` section separated by
+//! horizontal rules.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -157,6 +158,11 @@ fn parse_slide(xml: &str) -> (Vec<ShapeContent>, Vec<ConversionWarning>) {
     let mut graphic_frame_depth: u32 = 0;
     let mut picture_depth: u32 = 0;
 
+    // Group shape depth: <p:grpSp> is a transparent container — child shapes
+    // (sp, graphicFrame, pic) are processed normally. The counter tracks nesting
+    // for proper End-tag matching but does not gate any logic.
+    let mut group_depth: u32 = 0;
+
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
@@ -164,6 +170,9 @@ fn parse_slide(xml: &str) -> (Vec<ShapeContent>, Vec<ConversionWarning>) {
                 let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
 
                 match local_str {
+                    "grpSp" if !in_shape && !in_graphic_frame && !in_picture => {
+                        group_depth += 1;
+                    }
                     "sp" if !in_shape && !in_graphic_frame && !in_picture => {
                         in_shape = true;
                         shape_depth = 1;
@@ -358,6 +367,8 @@ fn parse_slide(xml: &str) -> (Vec<ShapeContent>, Vec<ConversionWarning>) {
                         in_picture = false;
                         current_image_alt = None;
                     }
+                } else if local_str == "grpSp" && group_depth > 0 {
+                    group_depth -= 1;
                 }
             }
             Ok(Event::Eof) => break,
@@ -1946,5 +1957,98 @@ mod tests {
                 .any(|w| w.code == WarningCode::SkippedElement
                     && w.message.contains("image description failed")),
         );
+    }
+
+    // ---- Group shape tests ----
+
+    #[test]
+    fn test_pptx_group_shape_text_extracted() {
+        // A single <p:sp> inside a <p:grpSp> should have its text extracted
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:grpSp><p:nvGrpSpPr><p:cNvPr id="10" name="Group 1"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="11" name="TextBox"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:txBody><a:p><a:r><a:t>Group text</a:t></a:r></a:p></p:txBody></p:sp></p:grpSp></p:spTree></p:cSld></p:sld>"#;
+
+        let (shapes, warnings) = parse_slide(slide_xml);
+        assert!(warnings.is_empty());
+        assert_eq!(shapes.len(), 1);
+        match &shapes[0] {
+            ShapeContent::Body(text) => assert_eq!(text, "Group text"),
+            other => panic!("expected Body, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pptx_group_shape_multiple_children() {
+        // Two <p:sp> shapes inside one <p:grpSp>
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:grpSp><p:nvGrpSpPr><p:cNvPr id="10" name="Group"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="11" name="Shape1"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:txBody><a:p><a:r><a:t>First shape</a:t></a:r></a:p></p:txBody></p:sp><p:sp><p:nvSpPr><p:cNvPr id="12" name="Shape2"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:txBody><a:p><a:r><a:t>Second shape</a:t></a:r></a:p></p:txBody></p:sp></p:grpSp></p:spTree></p:cSld></p:sld>"#;
+
+        let (shapes, warnings) = parse_slide(slide_xml);
+        assert!(warnings.is_empty());
+        assert_eq!(shapes.len(), 2);
+        match &shapes[0] {
+            ShapeContent::Body(text) => assert_eq!(text, "First shape"),
+            other => panic!("expected Body, got {:?}", other),
+        }
+        match &shapes[1] {
+            ShapeContent::Body(text) => assert_eq!(text, "Second shape"),
+            other => panic!("expected Body, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pptx_group_shape_nested() {
+        // <p:grpSp> inside <p:grpSp> with a <p:sp> child
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:grpSp><p:nvGrpSpPr><p:cNvPr id="10" name="Outer"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:grpSp><p:nvGrpSpPr><p:cNvPr id="11" name="Inner"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="12" name="Deep"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:txBody><a:p><a:r><a:t>Nested group text</a:t></a:r></a:p></p:txBody></p:sp></p:grpSp></p:grpSp></p:spTree></p:cSld></p:sld>"#;
+
+        let (shapes, warnings) = parse_slide(slide_xml);
+        assert!(warnings.is_empty());
+        assert_eq!(shapes.len(), 1);
+        match &shapes[0] {
+            ShapeContent::Body(text) => assert_eq!(text, "Nested group text"),
+            other => panic!("expected Body, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pptx_group_shape_with_table() {
+        // <p:graphicFrame> (table) inside a <p:grpSp>
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:grpSp><p:nvGrpSpPr><p:cNvPr id="10" name="Group"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="11" name="Table"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><a:graphic><a:graphicData><a:tbl><a:tr><a:tc><a:txBody><a:p><a:r><a:t>H1</a:t></a:r></a:p></a:txBody></a:tc><a:tc><a:txBody><a:p><a:r><a:t>H2</a:t></a:r></a:p></a:txBody></a:tc></a:tr><a:tr><a:tc><a:txBody><a:p><a:r><a:t>A</a:t></a:r></a:p></a:txBody></a:tc><a:tc><a:txBody><a:p><a:r><a:t>B</a:t></a:r></a:p></a:txBody></a:tc></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame></p:grpSp></p:spTree></p:cSld></p:sld>"#;
+
+        let (shapes, warnings) = parse_slide(slide_xml);
+        assert!(warnings.is_empty());
+        assert_eq!(shapes.len(), 1);
+        match &shapes[0] {
+            ShapeContent::Table { headers, rows } => {
+                assert_eq!(headers, &["H1", "H2"]);
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0], &["A", "B"]);
+            }
+            other => panic!("expected Table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pptx_group_shape_with_image() {
+        // <p:pic> inside a <p:grpSp>
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:cSld><p:spTree><p:grpSp><p:nvGrpSpPr><p:cNvPr id="10" name="Group"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:pic><p:nvPicPr><p:cNvPr id="11" descr="Alt text" name="Picture"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rIdImg1"/></p:blipFill></p:pic></p:grpSp></p:spTree></p:cSld></p:sld>"#;
+
+        let (shapes, warnings) = parse_slide(slide_xml);
+        assert!(warnings.is_empty());
+        assert_eq!(shapes.len(), 1);
+        match &shapes[0] {
+            ShapeContent::Image { rel_id, alt_text } => {
+                assert_eq!(rel_id, "rIdImg1");
+                assert_eq!(alt_text.as_deref(), Some("Alt text"));
+            }
+            other => panic!("expected Image, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pptx_group_shape_empty() {
+        // Empty <p:grpSp> produces no shapes
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:grpSp><p:nvGrpSpPr><p:cNvPr id="10" name="Empty Group"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/></p:grpSp></p:spTree></p:cSld></p:sld>"#;
+
+        let (shapes, warnings) = parse_slide(slide_xml);
+        assert!(warnings.is_empty());
+        assert!(shapes.is_empty());
     }
 }

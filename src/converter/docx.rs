@@ -2,7 +2,9 @@
 //!
 //! Parses DOCX files directly from their OOXML ZIP structure using `zip` + `quick-xml`,
 //! without intermediate HTML conversion. Extracts headings, paragraphs, tables,
-//! bold/italic, hyperlinks, lists, and embedded images.
+//! bold/italic, hyperlinks, lists, embedded images, and text boxes (`w:pict` /
+//! `v:textbox` / `w:txbxContent`). Text boxes wrapped in `mc:AlternateContent` are
+//! handled by skipping the `mc:Choice` branch and processing `mc:Fallback` (VML).
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -286,6 +288,32 @@ struct RunSegment {
     italic: bool,
 }
 
+/// Saved paragraph-level state for text box context save/restore.
+///
+/// When entering `<w:txbxContent>`, the current paragraph state is saved and reset
+/// so that inner `<w:p>` elements can be processed normally. On exit, the state is
+/// restored to continue the outer paragraph.
+#[derive(Debug, Clone)]
+struct SavedParagraphState {
+    in_paragraph: bool,
+    in_run: bool,
+    in_text: bool,
+    in_run_properties: bool,
+    current_para_kind: ParagraphKind,
+    current_para_runs: Vec<RunSegment>,
+    current_para_runs_plain: Vec<RunSegment>,
+    current_run_bold: bool,
+    current_run_italic: bool,
+    in_hyperlink: bool,
+    current_hyperlink_url: Option<String>,
+    hyperlink_runs: Vec<RunSegment>,
+    hyperlink_runs_plain: Vec<RunSegment>,
+    in_para_properties: bool,
+    in_num_pr: bool,
+    current_num_id: Option<String>,
+    current_ilvl: Option<u8>,
+}
+
 /// Merge adjacent segments with the same formatting, then apply `wrap_formatting`
 /// once per merged group.
 fn merge_and_format_runs(runs: &[RunSegment]) -> String {
@@ -402,11 +430,97 @@ fn parse_document(
     // Image info tracking for placeholder-based replacement
     let mut image_infos: Vec<ImageInfo> = Vec::new();
 
+    // mc:AlternateContent state: skip Choice, process Fallback
+    let mut in_mc_choice = false;
+    let mut mc_choice_depth: u32 = 0;
+
+    // Text box state: w:pict > v:shape > v:textbox > w:txbxContent
+    let mut in_pict = false;
+    let mut in_textbox_content = false;
+    let mut saved_paragraph_state: Option<SavedParagraphState> = None;
+
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
                 let local = e.local_name();
                 let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+
+                // mc:AlternateContent handling: skip Choice, process Fallback
+                if in_mc_choice {
+                    mc_choice_depth += 1;
+                    continue;
+                }
+                match local_str {
+                    "AlternateContent" => {
+                        // Just a wrapper — content inside is either Choice or Fallback
+                        continue;
+                    }
+                    "Choice" => {
+                        in_mc_choice = true;
+                        mc_choice_depth = 1;
+                        continue;
+                    }
+                    "Fallback" => {
+                        // Process Fallback content normally — just skip this tag
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                // Text box handling: w:pict > ... > w:txbxContent
+                match local_str {
+                    "pict" if in_run => {
+                        in_pict = true;
+                        continue;
+                    }
+                    "txbxContent" if in_pict => {
+                        // Save current paragraph state and reset for inner paragraphs
+                        saved_paragraph_state = Some(SavedParagraphState {
+                            in_paragraph,
+                            in_run,
+                            in_text,
+                            in_run_properties,
+                            current_para_kind: current_para_kind.clone(),
+                            current_para_runs: current_para_runs.clone(),
+                            current_para_runs_plain: current_para_runs_plain.clone(),
+                            current_run_bold,
+                            current_run_italic,
+                            in_hyperlink,
+                            current_hyperlink_url: current_hyperlink_url.clone(),
+                            hyperlink_runs: hyperlink_runs.clone(),
+                            hyperlink_runs_plain: hyperlink_runs_plain.clone(),
+                            in_para_properties,
+                            in_num_pr,
+                            current_num_id: current_num_id.clone(),
+                            current_ilvl,
+                        });
+                        // Reset paragraph-level state for text box content
+                        in_paragraph = false;
+                        in_run = false;
+                        in_text = false;
+                        in_run_properties = false;
+                        current_para_kind = ParagraphKind::Normal;
+                        current_para_runs.clear();
+                        current_para_runs_plain.clear();
+                        current_run_bold = false;
+                        current_run_italic = false;
+                        in_hyperlink = false;
+                        current_hyperlink_url = None;
+                        hyperlink_runs.clear();
+                        hyperlink_runs_plain.clear();
+                        in_para_properties = false;
+                        in_num_pr = false;
+                        current_num_id = None;
+                        current_ilvl = None;
+                        in_textbox_content = true;
+                        continue;
+                    }
+                    // VML elements inside w:pict are transparent containers
+                    "shape" | "rect" | "roundrect" | "textbox" | "group" if in_pict => {
+                        continue;
+                    }
+                    _ => {}
+                }
 
                 match local_str {
                     "body" => {
@@ -541,6 +655,9 @@ fn parse_document(
                 }
             }
             Ok(Event::Empty(ref e)) => {
+                if in_mc_choice {
+                    continue;
+                }
                 let local = e.local_name();
                 let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
 
@@ -625,6 +742,9 @@ fn parse_document(
                 }
             }
             Ok(Event::Text(ref e)) => {
+                if in_mc_choice {
+                    continue;
+                }
                 if in_text && in_run {
                     let text = e.unescape().unwrap_or_default().to_string();
                     let seg = RunSegment {
@@ -644,6 +764,62 @@ fn parse_document(
             Ok(Event::End(ref e)) => {
                 let local = e.local_name();
                 let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+
+                // mc:Choice depth tracking
+                if in_mc_choice {
+                    mc_choice_depth -= 1;
+                    if mc_choice_depth == 0 {
+                        in_mc_choice = false;
+                    }
+                    continue;
+                }
+
+                // mc:AlternateContent and mc:Fallback end tags — just skip
+                if local_str == "AlternateContent" || local_str == "Fallback" {
+                    continue;
+                }
+
+                // Text box end handling
+                if local_str == "txbxContent" && in_textbox_content {
+                    // Flush any pending paragraph inside the text box
+                    // (the normal "p" end handler will have already flushed it,
+                    // but guard against edge cases)
+                    in_textbox_content = false;
+                    // Restore saved paragraph state
+                    if let Some(saved) = saved_paragraph_state.take() {
+                        in_paragraph = saved.in_paragraph;
+                        in_run = saved.in_run;
+                        in_text = saved.in_text;
+                        in_run_properties = saved.in_run_properties;
+                        current_para_kind = saved.current_para_kind;
+                        current_para_runs = saved.current_para_runs;
+                        current_para_runs_plain = saved.current_para_runs_plain;
+                        current_run_bold = saved.current_run_bold;
+                        current_run_italic = saved.current_run_italic;
+                        in_hyperlink = saved.in_hyperlink;
+                        current_hyperlink_url = saved.current_hyperlink_url;
+                        hyperlink_runs = saved.hyperlink_runs;
+                        hyperlink_runs_plain = saved.hyperlink_runs_plain;
+                        in_para_properties = saved.in_para_properties;
+                        in_num_pr = saved.in_num_pr;
+                        current_num_id = saved.current_num_id;
+                        current_ilvl = saved.current_ilvl;
+                    }
+                    continue;
+                }
+                if local_str == "pict" && in_pict {
+                    in_pict = false;
+                    continue;
+                }
+                // VML end tags inside w:pict are transparent
+                if in_pict
+                    && matches!(
+                        local_str,
+                        "shape" | "rect" | "roundrect" | "textbox" | "group"
+                    )
+                {
+                    continue;
+                }
 
                 match local_str {
                     "body" => {
@@ -1194,7 +1370,7 @@ mod tests {
     /// Wrap paragraph content in a minimal document.xml structure.
     fn wrap_body(body: &str) -> String {
         format!(
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><w:body>{body}</w:body></w:document>"#
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office"><w:body>{body}</w:body></w:document>"#
         )
     }
 
@@ -2580,6 +2756,195 @@ mod tests {
         assert!(
             !result.title.as_deref().unwrap_or("").contains('['),
             "title must not contain [ from link syntax"
+        );
+    }
+
+    // ---- mc:AlternateContent tests ----
+
+    #[test]
+    fn test_docx_alternate_content_fallback_used() {
+        // mc:AlternateContent with Choice (DrawingML) and Fallback (VML).
+        // Fallback text should appear; Choice text should NOT.
+        let body = r#"<mc:AlternateContent><mc:Choice Requires="wps"><w:p><w:r><w:t>Choice text (should be hidden)</w:t></w:r></w:p></mc:Choice><mc:Fallback><w:p><w:r><w:t>Fallback text visible</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent>"#;
+        let doc = wrap_body(body);
+        let data = build_test_docx(&doc, None, None);
+        let converter = DocxConverter;
+        let result = converter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        assert!(
+            result.markdown.contains("Fallback text visible"),
+            "markdown was: {}",
+            result.markdown
+        );
+        assert!(
+            !result.markdown.contains("Choice text"),
+            "Choice text should be skipped, markdown was: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_docx_alternate_content_choice_skipped() {
+        // mc:AlternateContent with only Choice (no Fallback) — nothing should appear
+        let body = r#"<w:p><w:r><w:t>Before AC</w:t></w:r></w:p><mc:AlternateContent><mc:Choice Requires="wps"><w:p><w:r><w:t>Hidden</w:t></w:r></w:p></mc:Choice></mc:AlternateContent><w:p><w:r><w:t>After AC</w:t></w:r></w:p>"#;
+        let doc = wrap_body(body);
+        let data = build_test_docx(&doc, None, None);
+        let converter = DocxConverter;
+        let result = converter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        assert!(result.markdown.contains("Before AC"));
+        assert!(result.markdown.contains("After AC"));
+        assert!(
+            !result.markdown.contains("Hidden"),
+            "Choice content should be skipped, markdown was: {}",
+            result.markdown
+        );
+    }
+
+    // ---- Text box tests ----
+
+    #[test]
+    fn test_docx_textbox_basic() {
+        // Simple text box: w:pict > v:shape > v:textbox > w:txbxContent > w:p
+        let body = r#"<w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>Text box content</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>"#;
+        let doc = wrap_body(body);
+        let data = build_test_docx(&doc, None, None);
+        let converter = DocxConverter;
+        let result = converter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        assert!(
+            result.markdown.contains("Text box content"),
+            "markdown was: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_docx_textbox_with_formatting() {
+        // Bold and italic text inside a text box
+        let body = r#"<w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Bold in box</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>"#;
+        let doc = wrap_body(body);
+        let data = build_test_docx(&doc, None, None);
+        let converter = DocxConverter;
+        let result = converter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        assert!(
+            result.markdown.contains("**Bold in box**"),
+            "markdown was: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_docx_textbox_multiple_paragraphs() {
+        // Two paragraphs inside one text box
+        let body = r#"<w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>First TB para</w:t></w:r></w:p><w:p><w:r><w:t>Second TB para</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>"#;
+        let doc = wrap_body(body);
+        let data = build_test_docx(&doc, None, None);
+        let converter = DocxConverter;
+        let result = converter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        assert!(
+            result.markdown.contains("First TB para"),
+            "markdown was: {}",
+            result.markdown
+        );
+        assert!(
+            result.markdown.contains("Second TB para"),
+            "markdown was: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_docx_textbox_via_alternate_content() {
+        // Full mc:AlternateContent > Fallback > w:pict > v:shape > v:textbox path
+        let body = r#"<mc:AlternateContent><mc:Choice Requires="wps"><w:p><w:r><w:t>DrawingML choice</w:t></w:r></w:p></mc:Choice><mc:Fallback><w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>VML text box</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p></mc:Fallback></mc:AlternateContent>"#;
+        let doc = wrap_body(body);
+        let data = build_test_docx(&doc, None, None);
+        let converter = DocxConverter;
+        let result = converter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        assert!(
+            result.markdown.contains("VML text box"),
+            "markdown was: {}",
+            result.markdown
+        );
+        assert!(
+            !result.markdown.contains("DrawingML choice"),
+            "Choice content should be hidden, markdown was: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_docx_textbox_between_paragraphs() {
+        // Text box surrounded by normal paragraphs — verify document flow
+        let body = format!(
+            "{}{}{}",
+            para("Before text box."),
+            r#"<w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>Inside box</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>"#,
+            para("After text box.")
+        );
+        let doc = wrap_body(&body);
+        let data = build_test_docx(&doc, None, None);
+        let converter = DocxConverter;
+        let result = converter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        assert!(
+            result.markdown.contains("Before text box."),
+            "markdown was: {}",
+            result.markdown
+        );
+        assert!(
+            result.markdown.contains("Inside box"),
+            "markdown was: {}",
+            result.markdown
+        );
+        assert!(
+            result.markdown.contains("After text box."),
+            "markdown was: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_docx_textbox_unicode() {
+        // CJK and emoji in text box
+        let body = r#"<w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>한국어 🚀 中文</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>"#;
+        let doc = wrap_body(body);
+        let data = build_test_docx(&doc, None, None);
+        let converter = DocxConverter;
+        let result = converter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        assert!(result.markdown.contains("한국어"));
+        assert!(result.markdown.contains("🚀"));
+        assert!(result.markdown.contains("中文"));
+    }
+
+    #[test]
+    fn test_docx_textbox_empty() {
+        // Empty text box — should not crash or produce garbage output
+        let body = r#"<w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>"#;
+        let doc = wrap_body(body);
+        let data = build_test_docx(&doc, None, None);
+        let converter = DocxConverter;
+        let result = converter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        // Should not contain any text from the empty text box
+        assert!(
+            result.markdown.trim().is_empty(),
+            "expected empty output, got: {}",
+            result.markdown
         );
     }
 }

@@ -16,8 +16,8 @@ A pure Rust tool and library that converts various document formats into Markdow
 
 | Format | Extensions | Notes |
 |--------|-----------|-------|
-| DOCX | `.docx` | Headings, tables, lists, bold/italic, hyperlinks, images |
-| PPTX | `.pptx` | Slides, tables, speaker notes, images |
+| DOCX | `.docx` | Headings, tables, lists, bold/italic, hyperlinks, images, text boxes |
+| PPTX | `.pptx` | Slides, tables, speaker notes, images, group shapes |
 | XLSX | `.xlsx` | Multi-sheet, date/time handling, images |
 | XLS | `.xls` | Legacy Excel (via calamine) |
 | HTML | `.html`, `.htm` | Full DOM: headings, tables, lists, links, blockquotes, code blocks |
