@@ -74,6 +74,17 @@ fn test_cli_stdin_with_uppercase_format() {
         .stdout(predicate::str::contains("hello world"));
 }
 
+/// Stdin format should accept a leading dot.
+#[test]
+fn test_cli_stdin_with_dotted_format() {
+    cmd()
+        .args(["--format", ".txt"])
+        .write_stdin("hello world")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello world"));
+}
+
 /// Stdin with CSV format.
 #[test]
 fn test_cli_stdin_csv_format() {

@@ -144,8 +144,7 @@ pub fn convert_bytes(
     extension: &str,
     options: &ConversionOptions,
 ) -> Result<ConversionResult, ConvertError> {
-    let extension = extension.trim();
-    let extension_norm = extension.to_ascii_lowercase();
+    let extension_norm = normalize_extension(extension);
 
     if data.len() > options.max_input_bytes {
         return Err(ConvertError::InputTooLarge {
@@ -231,6 +230,13 @@ fn enforce_strict_mode(
     })
 }
 
+fn normalize_extension(extension: &str) -> String {
+    extension
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase()
+}
+
 /// Convert a file at the given path to Markdown with async image description.
 ///
 /// The format is auto-detected from magic bytes and file extension.
@@ -297,8 +303,7 @@ pub async fn convert_bytes_async(
     extension: &str,
     options: &converter::AsyncConversionOptions,
 ) -> Result<ConversionResult, ConvertError> {
-    let extension = extension.trim();
-    let extension_norm = extension.to_ascii_lowercase();
+    let extension_norm = normalize_extension(extension);
 
     if data.len() > options.base.max_input_bytes {
         return Err(ConvertError::InputTooLarge {
@@ -449,6 +454,12 @@ mod tests {
     #[test]
     fn test_convert_bytes_extension_case_insensitive() {
         let result = convert_bytes(b"hello world", " TXT ", &ConversionOptions::default()).unwrap();
+        assert!(result.markdown.contains("hello world"));
+    }
+
+    #[test]
+    fn test_convert_bytes_extension_with_leading_dot() {
+        let result = convert_bytes(b"hello world", ".txt", &ConversionOptions::default()).unwrap();
         assert!(result.markdown.contains("hello world"));
     }
 
