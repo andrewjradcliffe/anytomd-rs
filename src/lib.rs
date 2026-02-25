@@ -97,6 +97,14 @@ pub fn convert_file(
     options: &ConversionOptions,
 ) -> Result<ConversionResult, ConvertError> {
     let path = path.as_ref();
+    let size = std::fs::metadata(path)?.len() as usize;
+    if size > options.max_input_bytes {
+        return Err(ConvertError::InputTooLarge {
+            size,
+            limit: options.max_input_bytes,
+        });
+    }
+
     let data = std::fs::read(path)?;
 
     if data.len() > options.max_input_bytes {
@@ -106,8 +114,7 @@ pub fn convert_file(
         });
     }
 
-    let header = &data[..data.len().min(16)];
-    let format = detection::detect_format(path, header);
+    let format = detection::detect_format(path, &data);
 
     // For ZIP-based formats, introspect to find the specific type
     let (format, is_zip_magic) = match format {
@@ -137,6 +144,8 @@ pub fn convert_bytes(
     extension: &str,
     options: &ConversionOptions,
 ) -> Result<ConversionResult, ConvertError> {
+    let extension_norm = normalize_extension(extension);
+
     if data.len() > options.max_input_bytes {
         return Err(ConvertError::InputTooLarge {
             size: data.len(),
@@ -144,7 +153,7 @@ pub fn convert_bytes(
         });
     }
 
-    if extension == "pdf" {
+    if extension_norm == "pdf" {
         return Err(ConvertError::FormatNotSupported {
             extension: "pdf".to_string(),
             reason: "PDF is intentionally unsupported — Gemini, ChatGPT, and Claude \
@@ -169,8 +178,9 @@ pub fn convert_bytes(
     // needs the extension for language detection (the Converter trait's
     // convert() method doesn't receive the extension).
     let code_conv = CodeConverter;
-    if code_conv.can_convert(extension, data) {
-        return code_conv.convert_with_extension(data, extension, options);
+    if code_conv.can_convert(&extension_norm, data) {
+        let result = code_conv.convert_with_extension(data, &extension_norm, options)?;
+        return enforce_strict_mode(result, options.strict);
     }
 
     let converters: Vec<Box<dyn Converter>> = vec![
@@ -187,14 +197,44 @@ pub fn convert_bytes(
     ];
 
     for conv in &converters {
-        if conv.can_convert(extension, data) {
-            return conv.convert(data, options);
+        if conv.can_convert(&extension_norm, data) {
+            let result = conv.convert(data, options)?;
+            return enforce_strict_mode(result, options.strict);
         }
     }
 
     Err(ConvertError::UnsupportedFormat {
-        extension: extension.to_string(),
+        extension: extension_norm,
     })
+}
+
+fn enforce_strict_mode(
+    result: ConversionResult,
+    strict: bool,
+) -> Result<ConversionResult, ConvertError> {
+    if !strict || result.warnings.is_empty() {
+        return Ok(result);
+    }
+
+    let first = &result.warnings[0];
+    let loc = first
+        .location
+        .as_deref()
+        .map(|l| format!(" ({l})"))
+        .unwrap_or_default();
+    Err(ConvertError::MalformedDocument {
+        reason: format!(
+            "strict mode: encountered warning [{:?}] {}{}",
+            first.code, first.message, loc
+        ),
+    })
+}
+
+fn normalize_extension(extension: &str) -> String {
+    extension
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase()
 }
 
 /// Convert a file at the given path to Markdown with async image description.
@@ -212,6 +252,14 @@ pub async fn convert_file_async(
     options: &converter::AsyncConversionOptions,
 ) -> Result<ConversionResult, ConvertError> {
     let path = path.as_ref();
+    let size = std::fs::metadata(path)?.len() as usize;
+    if size > options.base.max_input_bytes {
+        return Err(ConvertError::InputTooLarge {
+            size,
+            limit: options.base.max_input_bytes,
+        });
+    }
+
     let data = std::fs::read(path)?;
 
     if data.len() > options.base.max_input_bytes {
@@ -221,8 +269,7 @@ pub async fn convert_file_async(
         });
     }
 
-    let header = &data[..data.len().min(16)];
-    let format = detection::detect_format(path, header);
+    let format = detection::detect_format(path, &data);
 
     let (format, is_zip_magic) = match format {
         Some("zip") => (detection::detect_zip_format(&data), true),
@@ -256,6 +303,8 @@ pub async fn convert_bytes_async(
     extension: &str,
     options: &converter::AsyncConversionOptions,
 ) -> Result<ConversionResult, ConvertError> {
+    let extension_norm = normalize_extension(extension);
+
     if data.len() > options.base.max_input_bytes {
         return Err(ConvertError::InputTooLarge {
             size: data.len(),
@@ -263,7 +312,7 @@ pub async fn convert_bytes_async(
         });
     }
 
-    if extension == "pdf" {
+    if extension_norm == "pdf" {
         return Err(ConvertError::FormatNotSupported {
             extension: "pdf".to_string(),
             reason: "PDF is intentionally unsupported — Gemini, ChatGPT, and Claude \
@@ -274,7 +323,7 @@ pub async fn convert_bytes_async(
 
     // For image-bearing formats, use convert_inner() + async resolve
     if let Some(ref describer) = options.async_image_describer {
-        match extension {
+        match extension_norm.as_str() {
             "docx" => {
                 let conv = converter::docx::DocxConverter;
                 let (mut result, pending) = conv.convert_inner(data, &options.base)?;
@@ -289,7 +338,7 @@ pub async fn convert_bytes_async(
                     )
                     .await;
                 }
-                return Ok(result);
+                return enforce_strict_mode(result, options.base.strict);
             }
             "pptx" => {
                 let conv = converter::pptx::PptxConverter;
@@ -305,7 +354,7 @@ pub async fn convert_bytes_async(
                     )
                     .await;
                 }
-                return Ok(result);
+                return enforce_strict_mode(result, options.base.strict);
             }
             "xlsx" | "xls" => {
                 let conv = converter::xlsx::XlsxConverter;
@@ -321,7 +370,7 @@ pub async fn convert_bytes_async(
                     )
                     .await;
                 }
-                return Ok(result);
+                return enforce_strict_mode(result, options.base.strict);
             }
             ext if converter::image::ImageConverter.can_convert(ext, data) => {
                 let conv = converter::image::ImageConverter;
@@ -337,14 +386,14 @@ pub async fn convert_bytes_async(
                     )
                     .await;
                 }
-                return Ok(result);
+                return enforce_strict_mode(result, options.base.strict);
             }
             _ => {}
         }
     }
 
     // Fallback: use sync convert for non-image formats or when no async describer
-    convert_bytes(data, extension, &options.base)
+    convert_bytes(data, &extension_norm, &options.base)
 }
 
 #[cfg(test)]
@@ -376,6 +425,42 @@ mod tests {
         };
         let result = convert_bytes(data, "txt", &options);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_convert_bytes_strict_mode_escalates_warning() {
+        // Non-UTF8 bytes trigger a recoverable decoding warning in txt converter.
+        let data = b"caf\xe9";
+        let options = ConversionOptions {
+            strict: true,
+            ..Default::default()
+        };
+        let result = convert_bytes(data, "txt", &options);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err}").contains("strict mode"),
+            "error should mention strict mode: {err}"
+        );
+    }
+
+    #[test]
+    fn test_convert_bytes_non_strict_keeps_warning() {
+        let data = b"caf\xe9";
+        let result = convert_bytes(data, "txt", &ConversionOptions::default()).unwrap();
+        assert!(!result.warnings.is_empty(), "expected decoding warning");
+    }
+
+    #[test]
+    fn test_convert_bytes_extension_case_insensitive() {
+        let result = convert_bytes(b"hello world", " TXT ", &ConversionOptions::default()).unwrap();
+        assert!(result.markdown.contains("hello world"));
+    }
+
+    #[test]
+    fn test_convert_bytes_extension_with_leading_dot() {
+        let result = convert_bytes(b"hello world", ".txt", &ConversionOptions::default()).unwrap();
+        assert!(result.markdown.contains("hello world"));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -469,6 +554,46 @@ mod tests {
         );
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_convert_file_unknown_ext_json_with_long_leading_whitespace() {
+        let dir = std::env::temp_dir().join("anytomd_test_json_whitespace_detect");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("payload.dat");
+        let mut data = vec![b' '; 40];
+        data.extend_from_slice(br#"{"k":1}"#);
+        std::fs::write(&file_path, data).unwrap();
+
+        let result = convert_file(&file_path, &ConversionOptions::default()).unwrap();
+        assert!(
+            result.markdown.contains("\"k\""),
+            "expected JSON conversion, markdown was: {}",
+            result.markdown
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_convert_file_unknown_ext_json_with_utf8_bom() {
+        let dir = std::env::temp_dir().join("anytomd_test_json_bom_detect");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("payload.dat");
+        let mut data = vec![0xEF, 0xBB, 0xBF];
+        data.extend_from_slice(br#"{"k":1}"#);
+        std::fs::write(&file_path, data).unwrap();
+
+        let result = convert_file(&file_path, &ConversionOptions::default()).unwrap();
+        assert!(
+            result.markdown.contains("\"k\""),
+            "expected JSON conversion, markdown was: {}",
+            result.markdown
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

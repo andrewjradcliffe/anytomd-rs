@@ -349,18 +349,20 @@ impl XlsxConverter {
                     total_image_bytes += img_data.len();
                     if total_image_bytes <= options.max_total_image_bytes {
                         let placeholder = format!("__img_{n}__", n = image_counter);
+                        let bytes_key = placeholder.clone();
                         image_counter += 1;
                         image_infos.push(ImageInfo {
                             placeholder: placeholder.clone(),
                             original_alt: String::new(),
                             filename: filename.clone(),
+                            bytes_key: bytes_key.clone(),
                         });
                         image_lines.push(format!("![{placeholder}]({filename})"));
                         plain_image_lines.push(placeholder);
                         if options.extract_images {
                             images.push((filename.clone(), img_data.clone()));
                         }
-                        image_bytes_map.insert(filename, img_data);
+                        image_bytes_map.insert(bytes_key, img_data);
                     } else {
                         warnings.push(ConversionWarning {
                             code: WarningCode::ResourceLimitReached,

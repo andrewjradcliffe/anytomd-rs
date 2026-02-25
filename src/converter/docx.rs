@@ -15,7 +15,7 @@ use zip::ZipArchive;
 
 use crate::converter::ooxml_utils::{
     ImageInfo, PendingImageResolution, Relationship, parse_relationships,
-    resolve_image_placeholders,
+    resolve_image_placeholders, resolve_relative_to_file,
 };
 use crate::converter::{
     ConversionOptions, ConversionResult, ConversionWarning, Converter, WarningCode,
@@ -978,6 +978,7 @@ fn parse_document(
                                     placeholder: placeholder.clone(),
                                     original_alt,
                                     filename: filename.clone(),
+                                    bytes_key: rel_id.clone(),
                                 });
                                 let img_md = format!("![{placeholder}]({filename})");
                                 let seg = RunSegment {
@@ -1208,27 +1209,26 @@ impl DocxConverter {
         let mut image_bytes_map: HashMap<String, Vec<u8>> = HashMap::new();
         if need_image_bytes {
             let mut total_image_bytes: usize = 0;
-            for rel in relationships.values() {
+            for (rel_id, rel) in &relationships {
                 if !rel.rel_type.contains("image") {
                     continue;
                 }
                 if total_image_bytes >= options.max_total_image_bytes {
                     break;
                 }
-                let image_path = format!("word/{}", rel.target);
+                let image_path = resolve_relative_to_file("word/document.xml", &rel.target);
                 if let Ok(Some(img_data)) = read_zip_bytes(&mut archive, &image_path) {
                     total_image_bytes += img_data.len();
                     if total_image_bytes <= options.max_total_image_bytes {
-                        let filename = rel
-                            .target
+                        let filename = image_path
                             .rsplit('/')
                             .next()
-                            .unwrap_or(&rel.target)
+                            .unwrap_or(&image_path)
                             .to_string();
                         if options.extract_images {
                             images.push((filename.clone(), img_data.clone()));
                         }
-                        image_bytes_map.insert(filename, img_data);
+                        image_bytes_map.insert(rel_id.clone(), img_data);
                     } else {
                         warnings.push(ConversionWarning {
                             code: WarningCode::ResourceLimitReached,
@@ -2319,6 +2319,52 @@ mod tests {
         assert!(!result.images.is_empty());
     }
 
+    #[test]
+    fn test_docx_image_describer_absolute_target_path() {
+        let body = r#"<w:p><w:r><w:drawing><wp:inline><wp:docPr descr="Original alt"/><a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip r:embed="rId2"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#;
+        let doc = wrap_body(body);
+        let rels = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="/word/media/image1.png"/></Relationships>"#;
+        let fake_png = b"fake-png-data";
+        let data = build_test_docx_with_image(&doc, rels, "word/media/image1.png", fake_png);
+
+        let converter = DocxConverter;
+        let options = ConversionOptions {
+            image_describer: Some(Arc::new(MockDescriber {
+                description: "Described image".to_string(),
+            })),
+            ..Default::default()
+        };
+        let result = converter.convert(&data, &options).unwrap();
+        assert!(
+            result.markdown.contains("![Described image](image1.png)"),
+            "markdown was: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_docx_image_describer_dot_slash_target_path() {
+        let body = r#"<w:p><w:r><w:drawing><wp:inline><wp:docPr descr="Original alt"/><a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip r:embed="rId2"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#;
+        let doc = wrap_body(body);
+        let rels = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="./media/image1.png"/></Relationships>"#;
+        let fake_png = b"fake-png-data";
+        let data = build_test_docx_with_image(&doc, rels, "word/media/image1.png", fake_png);
+
+        let converter = DocxConverter;
+        let options = ConversionOptions {
+            image_describer: Some(Arc::new(MockDescriber {
+                description: "Described image".to_string(),
+            })),
+            ..Default::default()
+        };
+        let result = converter.convert(&data, &options).unwrap();
+        assert!(
+            result.markdown.contains("![Described image](image1.png)"),
+            "markdown was: {}",
+            result.markdown
+        );
+    }
+
     /// Helper: build a DOCX with multiple embedded image files.
     fn build_test_docx_with_images(
         document_xml: &str,
@@ -2427,6 +2473,44 @@ mod tests {
             count, 2,
             "expected 2 described images, found {} in: {}",
             count, md
+        );
+    }
+
+    #[test]
+    fn test_docx_duplicate_basenames_different_paths_independent_descriptions() {
+        let body = format!(
+            "{}{}{}",
+            r#"<w:p><w:r><w:drawing><wp:inline><wp:docPr descr="First image"/><a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip r:embed="rId2"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#,
+            para("Text between images"),
+            r#"<w:p><w:r><w:drawing><wp:inline><wp:docPr descr="Second image"/><a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip r:embed="rId3"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#,
+        );
+        let doc = wrap_body(&body);
+        let rels = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/a/image1.png"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/b/image1.png"/></Relationships>"#;
+        let data = build_test_docx_with_images(
+            &doc,
+            rels,
+            &[
+                ("word/media/a/image1.png", b"fake-cat-png-data"),
+                ("word/media/b/image1.png", b"fake-dog-png-data"),
+            ],
+        );
+
+        let converter = DocxConverter;
+        let options = ConversionOptions {
+            image_describer: Some(Arc::new(MockDescriberByContent)),
+            ..Default::default()
+        };
+        let result = converter.convert(&data, &options).unwrap();
+        let md = &result.markdown;
+        assert!(
+            md.contains("![A photo of a cat](image1.png)"),
+            "expected cat description, markdown was: {}",
+            md
+        );
+        assert!(
+            md.contains("![A photo of a dog](image1.png)"),
+            "expected dog description, markdown was: {}",
+            md
         );
     }
 

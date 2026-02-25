@@ -740,6 +740,7 @@ fn render_slide(
     shapes: &[ShapeContent],
     notes: &Option<String>,
     image_filenames: &HashMap<String, String>,
+    slide_key: &str,
     image_counter: &mut usize,
 ) -> (String, String, Vec<ImageInfo>) {
     let mut out = String::new();
@@ -794,6 +795,7 @@ fn render_slide(
                         placeholder: placeholder.clone(),
                         original_alt: original_alt.clone(),
                         filename: filename.clone(),
+                        bytes_key: format!("{slide_key}::{rel_id}"),
                     });
                     out.push_str(&format!("![{placeholder}]({filename})\n\n"));
                     // Plain text: image description placeholder (resolved later)
@@ -939,7 +941,8 @@ impl PptxConverter {
                             if options.extract_images {
                                 images.push((filename.to_string(), img_data.clone()));
                             }
-                            all_image_bytes.insert(filename.to_string(), img_data);
+                            let bytes_key = format!("{}::{}", slide_info.path, rel_id);
+                            all_image_bytes.insert(bytes_key, img_data);
                         } else {
                             warnings.push(ConversionWarning {
                                 code: WarningCode::ResourceLimitReached,
@@ -970,6 +973,7 @@ impl PptxConverter {
                 &shapes,
                 &notes,
                 &image_filenames,
+                &slide_info.path,
                 &mut image_counter,
             );
 
@@ -1630,6 +1634,10 @@ mod tests {
     fn test_pptx_resolve_relative_to_file() {
         assert_eq!(
             resolve_relative_to_file("ppt/slides/slide1.xml", "../media/image1.png"),
+            "ppt/media/image1.png"
+        );
+        assert_eq!(
+            resolve_relative_to_file("ppt/slides/slide1.xml", "/ppt/media/image1.png"),
             "ppt/media/image1.png"
         );
         assert_eq!(

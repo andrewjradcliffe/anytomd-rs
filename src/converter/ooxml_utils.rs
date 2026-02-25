@@ -20,6 +20,9 @@ pub(crate) struct ImageInfo {
     pub(crate) placeholder: String,
     pub(crate) original_alt: String,
     pub(crate) filename: String,
+    /// Lookup key for image bytes in `PendingImageResolution::bytes`.
+    /// This can differ from `filename` when multiple images share a basename.
+    pub(crate) bytes_key: String,
 }
 
 /// Collected image data from a converter's parse phase, ready for resolution.
@@ -29,6 +32,7 @@ pub(crate) struct ImageInfo {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PendingImageResolution {
     pub(crate) infos: Vec<ImageInfo>,
+    /// Raw image bytes keyed by `ImageInfo::bytes_key`.
     pub(crate) bytes: HashMap<String, Vec<u8>>,
 }
 
@@ -50,7 +54,12 @@ pub(crate) fn parse_relationships(xml: &str) -> HashMap<String, Relationship> {
 
                     for attr in e.attributes().flatten() {
                         let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
-                        let val = String::from_utf8_lossy(&attr.value).to_string();
+                        let val = attr
+                            .decode_and_unescape_value(reader.decoder())
+                            .map(|v| v.into_owned())
+                            .unwrap_or_else(|_| {
+                                String::from_utf8_lossy(attr.value.as_ref()).to_string()
+                            });
                         match key {
                             "Id" => id = Some(val),
                             "Target" => target = Some(val),
@@ -91,28 +100,12 @@ pub(crate) fn derive_rels_path(file_path: &str) -> String {
 /// Example: base_dir=`xl/drawings`, target=`../media/image1.png`
 ///          -> `xl/media/image1.png`
 pub(crate) fn resolve_relative_path(base_dir: &str, target: &str) -> String {
-    if !target.starts_with("../") {
-        if base_dir.is_empty() {
-            return target.to_string();
-        }
-        return format!("{base_dir}/{target}");
-    }
-
-    let mut parts: Vec<&str> = base_dir.split('/').collect();
-
-    let mut remaining = target;
-    while let Some(rest) = remaining.strip_prefix("../") {
-        if parts.pop().is_none() {
-            break;
-        }
-        remaining = rest;
-    }
-
-    if parts.is_empty() {
-        remaining.to_string()
+    let joined = if target.starts_with('/') || base_dir.is_empty() {
+        target.to_string()
     } else {
-        format!("{}/{remaining}", parts.join("/"))
-    }
+        format!("{base_dir}/{target}")
+    };
+    normalize_package_path(&joined)
 }
 
 /// Resolve a relative path target against a base file path.
@@ -123,32 +116,31 @@ pub(crate) fn resolve_relative_path(base_dir: &str, target: &str) -> String {
 /// Example: base_file=`ppt/slides/slide1.xml`, target=`../media/image1.png`
 ///          -> `ppt/media/image1.png`
 pub(crate) fn resolve_relative_to_file(base_file: &str, target: &str) -> String {
-    if !target.starts_with("../") {
-        // Absolute or same-directory target
-        if let Some(pos) = base_file.rfind('/') {
-            return format!("{}/{target}", &base_file[..pos]);
-        }
-        return target.to_string();
-    }
-
-    // Walk up for each "../" prefix
-    let mut base_parts: Vec<&str> = base_file.split('/').collect();
-    // Remove the filename from base
-    base_parts.pop();
-
-    let mut target_remaining = target;
-    while let Some(rest) = target_remaining.strip_prefix("../") {
-        if base_parts.pop().is_none() {
-            break;
-        }
-        target_remaining = rest;
-    }
-
-    if base_parts.is_empty() {
-        target_remaining.to_string()
+    let base_dir = base_file
+        .rfind('/')
+        .map(|pos| &base_file[..pos])
+        .unwrap_or("");
+    let joined = if target.starts_with('/') || base_dir.is_empty() {
+        target.to_string()
     } else {
-        format!("{}/{target_remaining}", base_parts.join("/"))
+        format!("{base_dir}/{target}")
+    };
+    normalize_package_path(&joined)
+}
+
+fn normalize_package_path(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            let _ = out.pop();
+            continue;
+        }
+        out.push(part);
     }
+    out.join("/")
 }
 
 /// Replace image placeholders in markdown and plain text with descriptions
@@ -163,7 +155,10 @@ pub(crate) fn resolve_image_placeholders(
 ) {
     if let Some(describer) = describer {
         for info in image_infos {
-            if let Some(img_data) = image_bytes.get(&info.filename) {
+            if let Some(img_data) = image_bytes
+                .get(&info.bytes_key)
+                .or_else(|| image_bytes.get(&info.filename))
+            {
                 let mime = crate::converter::mime_from_image(&info.filename, img_data);
                 let prompt = "Describe this image concisely for use as alt text.";
                 match describer.describe(img_data, mime, prompt) {
@@ -239,7 +234,9 @@ pub(crate) async fn resolve_image_placeholders_async(
     let futures: Vec<_> = image_infos
         .iter()
         .map(|info| {
-            let bytes_opt = image_bytes.get(&info.filename);
+            let bytes_opt = image_bytes
+                .get(&info.bytes_key)
+                .or_else(|| image_bytes.get(&info.filename));
             async move {
                 if let Some(img_data) = bytes_opt {
                     let mime = crate::converter::mime_from_image(&info.filename, img_data);
@@ -304,6 +301,14 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_relationships_unescapes_target_entities() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com?a=1&amp;b=2" TargetMode="External"/></Relationships>"#;
+        let rels = parse_relationships(xml);
+        let r1 = rels.get("rId1").expect("missing rId1");
+        assert_eq!(r1.target, "https://example.com?a=1&b=2");
+    }
+
+    #[test]
     fn test_parse_relationships_empty() {
         let xml = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>"#;
         let rels = parse_relationships(xml);
@@ -358,6 +363,14 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_relative_path_current_dir_segment() {
+        assert_eq!(
+            resolve_relative_path("xl/drawings", "./media/image1.png"),
+            "xl/drawings/media/image1.png"
+        );
+    }
+
+    #[test]
     fn test_resolve_relative_path_empty_base() {
         assert_eq!(resolve_relative_path("", "image1.png"), "image1.png");
     }
@@ -379,6 +392,14 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_relative_to_file_current_dir_segment() {
+        assert_eq!(
+            resolve_relative_to_file("word/document.xml", "./media/image1.png"),
+            "word/media/image1.png"
+        );
+    }
+
+    #[test]
     fn test_resolve_relative_to_file_no_dir() {
         assert_eq!(
             resolve_relative_to_file("slide.xml", "image1.png"),
@@ -387,23 +408,27 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_relative_to_file_absolute_path() {
+        assert_eq!(
+            resolve_relative_to_file("ppt/slides/slide1.xml", "/ppt/media/image1.png"),
+            "ppt/media/image1.png"
+        );
+    }
+
+    #[test]
     fn test_resolve_relative_path_excessive_parent_stops_at_root() {
         // base "a" has 1 segment. "../../etc/passwd" tries 2 levels up.
-        // First "../" pops "a"; second "../" finds empty vec and breaks.
-        // The unresolved "../etc/passwd" remains as-is.
-        assert_eq!(
-            resolve_relative_path("a", "../../etc/passwd"),
-            "../etc/passwd"
-        );
+        // After reaching root, extra "../" are clamped.
+        assert_eq!(resolve_relative_path("a", "../../etc/passwd"), "etc/passwd");
     }
 
     #[test]
     fn test_resolve_relative_to_file_excessive_parent_stops_at_root() {
         // base_file "a/b.xml" → directory segments: ["a"].
-        // First "../" pops "a"; second "../" finds empty vec and breaks.
+        // After reaching root, extra "../" are clamped.
         assert_eq!(
             resolve_relative_to_file("a/b.xml", "../../etc/passwd"),
-            "../etc/passwd"
+            "etc/passwd"
         );
     }
 
@@ -425,11 +450,13 @@ mod tests {
                 placeholder: "__img_0__".to_string(),
                 original_alt: "A cat".to_string(),
                 filename: "cat.png".to_string(),
+                bytes_key: "__img_0__".to_string(),
             },
             ImageInfo {
                 placeholder: "__img_1__".to_string(),
                 original_alt: "A dog".to_string(),
                 filename: "dog.png".to_string(),
+                bytes_key: "__img_1__".to_string(),
             },
         ];
         let image_bytes = HashMap::new();
@@ -466,6 +493,7 @@ mod tests {
             placeholder: "__img_0__".to_string(),
             original_alt: "A cat".to_string(),
             filename: "cat.png".to_string(),
+            bytes_key: "__img_0__".to_string(),
         }];
         let mut image_bytes = HashMap::new();
         image_bytes.insert("cat.png".to_string(), vec![0x89, b'P', b'N', b'G']);
@@ -509,6 +537,7 @@ mod tests {
             placeholder: "__img_0__".to_string(),
             original_alt: "A cat".to_string(),
             filename: "cat.png".to_string(),
+            bytes_key: "__img_0__".to_string(),
         }];
         let mut image_bytes = HashMap::new();
         image_bytes.insert("cat.png".to_string(), vec![0x89, b'P', b'N', b'G']);
@@ -526,6 +555,66 @@ mod tests {
         assert_eq!(pt, "A cat");
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].message.contains("image description failed"));
+    }
+
+    #[test]
+    fn test_resolve_image_placeholders_bytes_key_disambiguates_same_filename() {
+        use crate::converter::ImageDescriber;
+        use crate::error::ConvertError;
+
+        struct ByteKeyDescriber;
+        impl ImageDescriber for ByteKeyDescriber {
+            fn describe(
+                &self,
+                image_bytes: &[u8],
+                _mime_type: &str,
+                _prompt: &str,
+            ) -> Result<String, ConvertError> {
+                match image_bytes.first().copied() {
+                    Some(b'A') => Ok("DESC_A".to_string()),
+                    Some(b'B') => Ok("DESC_B".to_string()),
+                    _ => Ok("DESC_UNKNOWN".to_string()),
+                }
+            }
+        }
+
+        let mut md = "![__img_0__](image1.png)\n![__img_1__](image1.png)".to_string();
+        let mut pt = "__img_0__\n__img_1__".to_string();
+        let infos = vec![
+            ImageInfo {
+                placeholder: "__img_0__".to_string(),
+                original_alt: "".to_string(),
+                filename: "image1.png".to_string(),
+                bytes_key: "k1".to_string(),
+            },
+            ImageInfo {
+                placeholder: "__img_1__".to_string(),
+                original_alt: "".to_string(),
+                filename: "image1.png".to_string(),
+                bytes_key: "k2".to_string(),
+            },
+        ];
+
+        let mut image_bytes = HashMap::new();
+        image_bytes.insert("k1".to_string(), b"A-image".to_vec());
+        image_bytes.insert("k2".to_string(), b"B-image".to_vec());
+
+        let mut warnings = Vec::new();
+        let describer = ByteKeyDescriber;
+        resolve_image_placeholders(
+            &mut md,
+            &mut pt,
+            &infos,
+            &image_bytes,
+            Some(&describer),
+            &mut warnings,
+        );
+
+        assert!(md.contains("![DESC_A](image1.png)"));
+        assert!(md.contains("![DESC_B](image1.png)"));
+        assert!(pt.contains("DESC_A"));
+        assert!(pt.contains("DESC_B"));
+        assert!(warnings.is_empty());
     }
 
     // ---- Async resolve tests (require tokio dev-dependency) ----
@@ -577,11 +666,13 @@ mod tests {
                     placeholder: "__img_0__".to_string(),
                     original_alt: "A cat".to_string(),
                     filename: "cat.png".to_string(),
+                    bytes_key: "__img_0__".to_string(),
                 },
                 ImageInfo {
                     placeholder: "__img_1__".to_string(),
                     original_alt: "A dog".to_string(),
                     filename: "dog.png".to_string(),
+                    bytes_key: "__img_1__".to_string(),
                 },
             ];
             let mut image_bytes = HashMap::new();
@@ -613,6 +704,7 @@ mod tests {
                 placeholder: "__img_0__".to_string(),
                 original_alt: "A cat".to_string(),
                 filename: "cat.png".to_string(),
+                bytes_key: "__img_0__".to_string(),
             }];
             let mut image_bytes = HashMap::new();
             image_bytes.insert("cat.png".to_string(), vec![0x89, b'P', b'N', b'G']);
@@ -641,6 +733,7 @@ mod tests {
                 placeholder: "__img_0__".to_string(),
                 original_alt: "A cat".to_string(),
                 filename: "cat.png".to_string(),
+                bytes_key: "__img_0__".to_string(),
             }];
             let image_bytes = HashMap::new(); // no bytes
             let mut warnings = Vec::new();

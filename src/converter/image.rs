@@ -84,13 +84,14 @@ impl ImageConverter {
         let plain_text = format!("{placeholder}\n");
 
         let image_infos = vec![ImageInfo {
-            placeholder,
+            placeholder: placeholder.clone(),
             original_alt: String::new(),
             filename: filename.clone(),
+            bytes_key: placeholder.clone(),
         }];
 
         let mut image_bytes_map = HashMap::new();
-        image_bytes_map.insert(filename.clone(), data.to_vec());
+        image_bytes_map.insert(placeholder.clone(), data.to_vec());
 
         // Extract image data if requested
         let images = if options.extract_images {

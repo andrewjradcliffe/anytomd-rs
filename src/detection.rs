@@ -34,7 +34,11 @@ pub fn detect_format(path: &Path, header_bytes: &[u8]) -> Option<&'static str> {
     }
 
     // 3. JSON heuristic (fallback for unknown extensions): starts with { or [
-    if let Some(&first) = header_bytes.iter().find(|b| !b.is_ascii_whitespace())
+    // Skip optional UTF-8 BOM before scanning.
+    let bytes = header_bytes
+        .strip_prefix(&[0xEF, 0xBB, 0xBF])
+        .unwrap_or(header_bytes);
+    if let Some(&first) = bytes.iter().find(|b| !b.is_ascii_whitespace())
         && (first == b'{' || first == b'[')
     {
         return Some("json");
@@ -226,6 +230,14 @@ mod tests {
         let path = PathBuf::from("data.dat");
         let content = b"{ \"key\": \"value\" }";
         assert_eq!(detect_format(&path, content), Some("json"));
+    }
+
+    #[test]
+    fn test_detect_format_unknown_ext_with_json_utf8_bom_returns_json() {
+        let path = PathBuf::from("data.dat");
+        let mut content = vec![0xEF, 0xBB, 0xBF];
+        content.extend_from_slice(b"{\"key\":\"value\"}");
+        assert_eq!(detect_format(&path, &content), Some("json"));
     }
 
     #[test]

@@ -63,6 +63,28 @@ fn test_cli_stdin_with_format() {
         .stdout(predicate::str::contains("hello world"));
 }
 
+/// Stdin format should be case-insensitive.
+#[test]
+fn test_cli_stdin_with_uppercase_format() {
+    cmd()
+        .args(["--format", "TXT"])
+        .write_stdin("hello world")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello world"));
+}
+
+/// Stdin format should accept a leading dot.
+#[test]
+fn test_cli_stdin_with_dotted_format() {
+    cmd()
+        .args(["--format", ".txt"])
+        .write_stdin("hello world")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello world"));
+}
+
 /// Stdin with CSV format.
 #[test]
 fn test_cli_stdin_csv_format() {
@@ -73,6 +95,22 @@ fn test_cli_stdin_csv_format() {
         .success()
         .stdout(predicate::str::contains("Alice"))
         .stdout(predicate::str::contains("| Name | Age |"));
+}
+
+/// Stdin JSON with UTF-16 LE BOM should be decoded.
+#[test]
+fn test_cli_stdin_json_utf16_bom() {
+    let mut input = vec![0xFF, 0xFE];
+    for code_unit in "{\"k\":1}\n".encode_utf16() {
+        input.extend_from_slice(&code_unit.to_le_bytes());
+    }
+
+    cmd()
+        .args(["--format", "json"])
+        .write_stdin(input)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"k\""));
 }
 
 /// --format overrides file extension detection.
@@ -153,6 +191,18 @@ fn test_cli_strict_flag() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Alice"));
+}
+
+/// --strict should fail when conversion would otherwise emit warnings.
+#[test]
+fn test_cli_strict_flag_fails_on_warning() {
+    cmd()
+        .args(["--strict", "--format", "txt"])
+        .write_stdin(vec![0xE9])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("strict mode"));
 }
 
 /// Multiple files where one is missing: partial success with exit code 1.

@@ -18,7 +18,7 @@ impl Converter for JsonConverter {
         data: &[u8],
         _options: &ConversionOptions,
     ) -> Result<ConversionResult, ConvertError> {
-        let text = String::from_utf8(data.to_vec())?;
+        let (text, encoding_warning) = super::decode_text(data);
 
         // Parse and re-serialize for pretty-printing
         let value: serde_json::Value =
@@ -33,10 +33,15 @@ impl Converter for JsonConverter {
 
         let markdown = format!("```json\n{pretty}\n```\n");
         let plain_text = format!("{pretty}\n");
+        let mut warnings = Vec::new();
+        if let Some(w) = encoding_warning {
+            warnings.push(w);
+        }
 
         Ok(ConversionResult {
             markdown,
             plain_text,
+            warnings,
             ..Default::default()
         })
     }
@@ -202,5 +207,31 @@ mod tests {
         let input = vec![0xFF, 0xFE];
         let result = converter.convert(&input, &ConversionOptions::default());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_json_utf8_bom_is_accepted() {
+        let converter = JsonConverter;
+        let mut input = vec![0xEF, 0xBB, 0xBF];
+        input.extend_from_slice(br#"{"k":1}"#);
+        let result = converter
+            .convert(&input, &ConversionOptions::default())
+            .unwrap();
+        assert!(result.markdown.contains("\"k\""));
+        assert!(result.markdown.contains("1"));
+    }
+
+    #[test]
+    fn test_json_utf16_le_bom_is_accepted_with_warning() {
+        let converter = JsonConverter;
+        let mut input = vec![0xFF, 0xFE];
+        for code_unit in "{\"k\":1}".encode_utf16() {
+            input.extend_from_slice(&code_unit.to_le_bytes());
+        }
+        let result = converter
+            .convert(&input, &ConversionOptions::default())
+            .unwrap();
+        assert!(result.markdown.contains("\"k\""));
+        assert!(!result.warnings.is_empty(), "expected encoding warning");
     }
 }
