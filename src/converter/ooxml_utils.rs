@@ -100,9 +100,7 @@ pub(crate) fn derive_rels_path(file_path: &str) -> String {
 /// Example: base_dir=`xl/drawings`, target=`../media/image1.png`
 ///          -> `xl/media/image1.png`
 pub(crate) fn resolve_relative_path(base_dir: &str, target: &str) -> String {
-    let joined = if target.starts_with('/') {
-        target.to_string()
-    } else if base_dir.is_empty() {
+    let joined = if target.starts_with('/') || base_dir.is_empty() {
         target.to_string()
     } else {
         format!("{base_dir}/{target}")
@@ -122,9 +120,7 @@ pub(crate) fn resolve_relative_to_file(base_file: &str, target: &str) -> String 
         .rfind('/')
         .map(|pos| &base_file[..pos])
         .unwrap_or("");
-    let joined = if target.starts_with('/') {
-        target.to_string()
-    } else if base_dir.is_empty() {
+    let joined = if target.starts_with('/') || base_dir.is_empty() {
         target.to_string()
     } else {
         format!("{base_dir}/{target}")
