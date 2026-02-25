@@ -114,8 +114,7 @@ pub fn convert_file(
         });
     }
 
-    let header = &data[..data.len().min(16)];
-    let format = detection::detect_format(path, header);
+    let format = detection::detect_format(path, &data);
 
     // For ZIP-based formats, introspect to find the specific type
     let (format, is_zip_magic) = match format {
@@ -264,8 +263,7 @@ pub async fn convert_file_async(
         });
     }
 
-    let header = &data[..data.len().min(16)];
-    let format = detection::detect_format(path, header);
+    let format = detection::detect_format(path, &data);
 
     let (format, is_zip_magic) = match format {
         Some("zip") => (detection::detect_zip_format(&data), true),
@@ -545,6 +543,26 @@ mod tests {
         );
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_convert_file_unknown_ext_json_with_long_leading_whitespace() {
+        let dir = std::env::temp_dir().join("anytomd_test_json_whitespace_detect");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("payload.dat");
+        let mut data = vec![b' '; 40];
+        data.extend_from_slice(br#"{"k":1}"#);
+        std::fs::write(&file_path, data).unwrap();
+
+        let result = convert_file(&file_path, &ConversionOptions::default()).unwrap();
+        assert!(
+            result.markdown.contains("\"k\""),
+            "expected JSON conversion, markdown was: {}",
+            result.markdown
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
