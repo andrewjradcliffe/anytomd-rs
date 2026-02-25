@@ -97,6 +97,14 @@ pub fn convert_file(
     options: &ConversionOptions,
 ) -> Result<ConversionResult, ConvertError> {
     let path = path.as_ref();
+    let size = std::fs::metadata(path)?.len() as usize;
+    if size > options.max_input_bytes {
+        return Err(ConvertError::InputTooLarge {
+            size,
+            limit: options.max_input_bytes,
+        });
+    }
+
     let data = std::fs::read(path)?;
 
     if data.len() > options.max_input_bytes {
@@ -170,7 +178,8 @@ pub fn convert_bytes(
     // convert() method doesn't receive the extension).
     let code_conv = CodeConverter;
     if code_conv.can_convert(extension, data) {
-        return code_conv.convert_with_extension(data, extension, options);
+        let result = code_conv.convert_with_extension(data, extension, options)?;
+        return enforce_strict_mode(result, options.strict);
     }
 
     let converters: Vec<Box<dyn Converter>> = vec![
@@ -188,12 +197,35 @@ pub fn convert_bytes(
 
     for conv in &converters {
         if conv.can_convert(extension, data) {
-            return conv.convert(data, options);
+            let result = conv.convert(data, options)?;
+            return enforce_strict_mode(result, options.strict);
         }
     }
 
     Err(ConvertError::UnsupportedFormat {
         extension: extension.to_string(),
+    })
+}
+
+fn enforce_strict_mode(
+    result: ConversionResult,
+    strict: bool,
+) -> Result<ConversionResult, ConvertError> {
+    if !strict || result.warnings.is_empty() {
+        return Ok(result);
+    }
+
+    let first = &result.warnings[0];
+    let loc = first
+        .location
+        .as_deref()
+        .map(|l| format!(" ({l})"))
+        .unwrap_or_default();
+    Err(ConvertError::MalformedDocument {
+        reason: format!(
+            "strict mode: encountered warning [{:?}] {}{}",
+            first.code, first.message, loc
+        ),
     })
 }
 
@@ -212,6 +244,14 @@ pub async fn convert_file_async(
     options: &converter::AsyncConversionOptions,
 ) -> Result<ConversionResult, ConvertError> {
     let path = path.as_ref();
+    let size = std::fs::metadata(path)?.len() as usize;
+    if size > options.base.max_input_bytes {
+        return Err(ConvertError::InputTooLarge {
+            size,
+            limit: options.base.max_input_bytes,
+        });
+    }
+
     let data = std::fs::read(path)?;
 
     if data.len() > options.base.max_input_bytes {
@@ -289,7 +329,7 @@ pub async fn convert_bytes_async(
                     )
                     .await;
                 }
-                return Ok(result);
+                return enforce_strict_mode(result, options.base.strict);
             }
             "pptx" => {
                 let conv = converter::pptx::PptxConverter;
@@ -305,7 +345,7 @@ pub async fn convert_bytes_async(
                     )
                     .await;
                 }
-                return Ok(result);
+                return enforce_strict_mode(result, options.base.strict);
             }
             "xlsx" | "xls" => {
                 let conv = converter::xlsx::XlsxConverter;
@@ -321,7 +361,7 @@ pub async fn convert_bytes_async(
                     )
                     .await;
                 }
-                return Ok(result);
+                return enforce_strict_mode(result, options.base.strict);
             }
             ext if converter::image::ImageConverter.can_convert(ext, data) => {
                 let conv = converter::image::ImageConverter;
@@ -337,7 +377,7 @@ pub async fn convert_bytes_async(
                     )
                     .await;
                 }
-                return Ok(result);
+                return enforce_strict_mode(result, options.base.strict);
             }
             _ => {}
         }
@@ -376,6 +416,30 @@ mod tests {
         };
         let result = convert_bytes(data, "txt", &options);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_convert_bytes_strict_mode_escalates_warning() {
+        // Non-UTF8 bytes trigger a recoverable decoding warning in txt converter.
+        let data = b"caf\xe9";
+        let options = ConversionOptions {
+            strict: true,
+            ..Default::default()
+        };
+        let result = convert_bytes(data, "txt", &options);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err}").contains("strict mode"),
+            "error should mention strict mode: {err}"
+        );
+    }
+
+    #[test]
+    fn test_convert_bytes_non_strict_keeps_warning() {
+        let data = b"caf\xe9";
+        let result = convert_bytes(data, "txt", &ConversionOptions::default()).unwrap();
+        assert!(!result.warnings.is_empty(), "expected decoding warning");
     }
 
     #[cfg(not(target_arch = "wasm32"))]

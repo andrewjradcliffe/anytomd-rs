@@ -155,6 +155,18 @@ fn test_cli_strict_flag() {
         .stdout(predicate::str::contains("Alice"));
 }
 
+/// --strict should fail when conversion would otherwise emit warnings.
+#[test]
+fn test_cli_strict_flag_fails_on_warning() {
+    cmd()
+        .args(["--strict", "--format", "txt"])
+        .write_stdin(vec![0xE9])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("strict mode"));
+}
+
 /// Multiple files where one is missing: partial success with exit code 1.
 #[test]
 fn test_cli_partial_failure_multiple_files() {
