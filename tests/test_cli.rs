@@ -282,11 +282,7 @@ fn test_cli_gemini_without_api_key() {
 #[test]
 fn test_cli_gemini_model_requires_gemini() {
     cmd()
-        .args([
-            "--gemini-model",
-            "some-model",
-            "tests/fixtures/sample.csv",
-        ])
+        .args(["--gemini-model", "some-model", "tests/fixtures/sample.csv"])
         .assert()
         .failure()
         .code(2);

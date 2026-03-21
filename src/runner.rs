@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use anytomd::{
-    convert_bytes, convert_file, gemini::GeminiDescriber, ConversionOptions, ConversionWarning,
+    ConversionOptions, ConversionWarning, convert_bytes, convert_file, gemini::GeminiDescriber,
 };
 
 enum Output {
@@ -144,7 +144,11 @@ fn write_result(
     plain_text: bool,
 ) -> Result<(), ExitCode> {
     print_warnings(&result.warnings);
-    let text = if plain_text { result.plain_text } else { result.markdown };
+    let text = if plain_text {
+        result.plain_text
+    } else {
+        result.markdown
+    };
     out.write_all(text.as_bytes()).map_err(write_err)
 }
 
@@ -184,8 +188,7 @@ fn convert(
             out.write_all(b"\n").map_err(write_err)?;
         }
         if multiple && !plain_text {
-            write!(out, "<!-- source: {} -->\n\n", path.display())
-                .map_err(write_err)?;
+            write!(out, "<!-- source: {} -->\n\n", path.display()).map_err(write_err)?;
         }
 
         let result = if let Some(fmt) = format {
