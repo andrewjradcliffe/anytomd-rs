@@ -40,20 +40,26 @@ pub(crate) struct Comment {
 /// Maximum number of characters retained for a comment's `source` text.
 pub(crate) const SOURCE_CAP: usize = 200;
 
-/// Collapse all runs of whitespace (spaces, tabs, newlines) into single spaces
-/// and trim the ends.
+/// Collapse runs of ASCII whitespace (space, tab, CR, LF, FF) into single
+/// spaces and trim the ends.
 ///
 /// Used to flatten multi-paragraph comment bodies and ranged source text into a
-/// single line suitable for a Markdown list item.
+/// single line suitable for a Markdown list item. Only ASCII whitespace is
+/// collapsed: meaningful non-ASCII spaces (NBSP U+00A0, ideographic space
+/// U+3000, etc.) are content and are preserved verbatim.
 pub(crate) fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    s.split(|c: char| c.is_ascii_whitespace())
+        .filter(|seg| !seg.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Truncate `s` to at most `max_chars` Unicode scalar values, appending `…`
 /// when truncation occurs.
 ///
-/// Truncation always lands on a character boundary, so multi-byte characters
-/// (CJK, emoji) are never split mid-byte.
+/// Truncation lands on a Unicode scalar (`char`) boundary, so the result is
+/// always valid UTF-8. Multi-scalar grapheme clusters (e.g. flag or ZWJ emoji)
+/// may be split at that boundary; this affects only the truncated tail.
 pub(crate) fn cap_text(s: &str, max_chars: usize) -> String {
     // `nth(max_chars)` yields the byte index of the character just past the cap
     // (0-indexed), which is exactly the truncation point and always a char
@@ -186,6 +192,16 @@ mod tests {
     #[test]
     fn test_collapse_ws_cjk_preserved() {
         assert_eq!(collapse_ws("한국어\n中文"), "한국어 中文");
+    }
+
+    #[test]
+    fn test_collapse_ws_preserves_non_ascii_spaces() {
+        // NBSP (U+00A0) and ideographic space (U+3000) are content, not layout,
+        // and must survive collapsing (project Unicode-fidelity goal).
+        assert_eq!(collapse_ws("a\u{00A0}b"), "a\u{00A0}b");
+        assert_eq!(collapse_ws("中\u{3000}文"), "中\u{3000}文");
+        // ASCII whitespace around a preserved NBSP still collapses.
+        assert_eq!(collapse_ws("  a\u{00A0}b \n c "), "a\u{00A0}b c");
     }
 
     // ---- cap_text ----

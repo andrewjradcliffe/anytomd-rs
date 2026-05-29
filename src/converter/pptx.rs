@@ -14,15 +14,15 @@ use zip::ZipArchive;
 
 use crate::converter::comments::{self, Comment};
 use crate::converter::ooxml_utils::{
-    ImageInfo, PendingImageResolution, Relationship, derive_rels_path, parse_relationships,
-    resolve_image_placeholders, resolve_relative_to_file,
+    ImageInfo, PendingImageResolution, Relationship, attr_value_unescaped, derive_rels_path,
+    parse_relationships, resolve_image_placeholders, resolve_relative_to_file,
 };
 use crate::converter::{
     ConversionOptions, ConversionResult, ConversionWarning, Converter, WarningCode,
 };
 use crate::error::ConvertError;
 use crate::markdown::{build_table, build_table_plain};
-use crate::zip_utils::{read_zip_bytes, read_zip_text};
+use crate::zip_utils::{read_zip_bytes, read_zip_text, read_zip_text_lossy};
 
 /// Converts PPTX files to Markdown.
 pub struct PptxConverter;
@@ -831,69 +831,24 @@ fn render_slide(
 
 // ---- Comment extraction ----
 
-/// Parse a legacy author registry (`ppt/commentAuthors.xml`).
+/// Parse an author registry, mapping each author `id` to its `name`.
 ///
-/// Maps the integer `id` to the author `name`. Elements:
-/// `<p:cmAuthor id="0" name="Julie Lee" initials="JL"/>`.
-fn parse_comment_authors_legacy(xml: &str) -> HashMap<String, String> {
+/// `elem` is the author element's local name — `cmAuthor` for the legacy
+/// `ppt/commentAuthors.xml` (`<p:cmAuthor id="0" name="Julie Lee"/>`) or
+/// `author` for the modern `ppt/authors.xml` (`<p188:author id="{GUID}"
+/// name="Julie Lee"/>`). Names are XML-unescaped.
+fn parse_author_registry(xml: &str, elem: &str) -> HashMap<String, String> {
     let mut reader = Reader::from_str(xml);
     let mut authors = HashMap::new();
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let local = e.local_name();
-                if std::str::from_utf8(local.as_ref()).unwrap_or("") == "cmAuthor" {
-                    let (mut id, mut name) = (None, String::new());
-                    for attr in e.attributes().flatten() {
-                        let k = attr.key.local_name();
-                        let k = std::str::from_utf8(k.as_ref()).unwrap_or("");
-                        let v = String::from_utf8_lossy(&attr.value).to_string();
-                        match k {
-                            "id" => id = Some(v),
-                            "name" => name = v,
-                            _ => {}
-                        }
-                    }
-                    if let Some(id) = id {
-                        authors.insert(id, name);
-                    }
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(_) => break,
-            _ => {}
-        }
-    }
-    authors
-}
-
-/// Parse a modern author registry (`ppt/authors.xml`).
-///
-/// Maps the GUID `id` to the author `name`. Elements:
-/// `<p188:author id="{GUID}" name="Julie Lee"/>` in the
-/// `http://schemas.microsoft.com/office/powerpoint/2018/8/main` namespace.
-fn parse_authors_modern(xml: &str) -> HashMap<String, String> {
-    let mut reader = Reader::from_str(xml);
-    let mut authors = HashMap::new();
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                let local = e.local_name();
-                if std::str::from_utf8(local.as_ref()).unwrap_or("") == "author" {
-                    let (mut id, mut name) = (None, String::new());
-                    for attr in e.attributes().flatten() {
-                        let k = attr.key.local_name();
-                        let k = std::str::from_utf8(k.as_ref()).unwrap_or("");
-                        let v = String::from_utf8_lossy(&attr.value).to_string();
-                        match k {
-                            "id" => id = Some(v),
-                            "name" => name = v,
-                            _ => {}
-                        }
-                    }
-                    if let Some(id) = id {
-                        authors.insert(id, name);
-                    }
+                if std::str::from_utf8(local.as_ref()).unwrap_or("") == elem
+                    && let Some(id) = attr_value_unescaped(e, "id")
+                {
+                    let name = attr_value_unescaped(e, "name").unwrap_or_default();
+                    authors.insert(id, name);
                 }
             }
             Ok(Event::Eof) => break,
@@ -929,7 +884,10 @@ fn parse_legacy_comments(xml: &str, authors: &HashMap<String, String>) -> Vec<Ra
 
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+            // Only Event::Start sets in_text: a self-closing `<p:text/>` (Empty,
+            // no End) would otherwise leave in_text stuck true and leak later
+            // text into the body.
+            Ok(Event::Start(ref e)) => {
                 let local = e.local_name();
                 let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
                 match local_str {
@@ -938,21 +896,31 @@ fn parse_legacy_comments(xml: &str, authors: &HashMap<String, String>) -> Vec<Ra
                         author = String::new();
                         date = String::new();
                         body = String::new();
-                        for attr in e.attributes().flatten() {
-                            let k = attr.key.local_name();
-                            let k = std::str::from_utf8(k.as_ref()).unwrap_or("");
-                            let v = String::from_utf8_lossy(&attr.value).to_string();
-                            match k {
-                                "authorId" => {
-                                    author = authors.get(&v).cloned().unwrap_or_default();
-                                }
-                                "dt" => date = v,
-                                _ => {}
-                            }
+                        if let Some(v) = attr_value_unescaped(e, "authorId") {
+                            author = authors.get(&v).cloned().unwrap_or_default();
+                        }
+                        if let Some(v) = attr_value_unescaped(e, "dt") {
+                            date = v;
                         }
                     }
                     "text" if in_cm => in_text = true,
                     _ => {}
+                }
+            }
+            // A self-closing `<p:cm .../>` (no children) still yields a comment.
+            Ok(Event::Empty(ref e)) => {
+                let local = e.local_name();
+                if std::str::from_utf8(local.as_ref()).unwrap_or("") == "cm" {
+                    let author = attr_value_unescaped(e, "authorId")
+                        .and_then(|v| authors.get(&v).cloned())
+                        .unwrap_or_default();
+                    let date = attr_value_unescaped(e, "dt").unwrap_or_default();
+                    out.push(RawPptxComment {
+                        author,
+                        date,
+                        body: String::new(),
+                        is_reply: false,
+                    });
                 }
             }
             Ok(Event::Text(ref e)) if in_text => {
@@ -1015,37 +983,46 @@ fn parse_modern_comments(xml: &str, authors: &HashMap<String, String>) -> Vec<Ra
     let mut next_seq: usize = 0;
     let mut in_text = false;
 
+    // Build a Frame from a cm/reply element's attributes.
+    let make_frame = |e: &quick_xml::events::BytesStart, is_reply: bool, seq: usize| {
+        let author = attr_value_unescaped(e, "authorId")
+            .and_then(|v| authors.get(&v).cloned())
+            .unwrap_or_default();
+        let date = attr_value_unescaped(e, "created").unwrap_or_default();
+        Frame {
+            seq,
+            author,
+            date,
+            body: String::new(),
+            is_reply,
+        }
+    };
+
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+            Ok(Event::Start(ref e)) => {
                 let local = e.local_name();
                 let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
                 match local_str {
                     "cm" | "reply" => {
-                        let mut frame = Frame {
-                            seq: next_seq,
-                            author: String::new(),
-                            date: String::new(),
-                            body: String::new(),
-                            is_reply: local_str == "reply",
-                        };
+                        stack.push(make_frame(e, local_str == "reply", next_seq));
                         next_seq += 1;
-                        for attr in e.attributes().flatten() {
-                            let k = attr.key.local_name();
-                            let k = std::str::from_utf8(k.as_ref()).unwrap_or("");
-                            let v = String::from_utf8_lossy(&attr.value).to_string();
-                            match k {
-                                "authorId" => {
-                                    frame.author = authors.get(&v).cloned().unwrap_or_default();
-                                }
-                                "created" => frame.date = v,
-                                _ => {}
-                            }
-                        }
-                        stack.push(frame);
                     }
+                    // Only Event::Start sets in_text: a self-closing `<a:t/>`
+                    // (Empty, no End) would otherwise leak later text into the
+                    // innermost open frame's body.
                     "t" if !stack.is_empty() => in_text = true,
                     _ => {}
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                // A self-closing `<p188:cm/>`/`<p188:reply/>` (no body) is a
+                // complete empty comment.
+                let local = e.local_name();
+                let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                if local_str == "cm" || local_str == "reply" {
+                    finished.push(make_frame(e, local_str == "reply", next_seq));
+                    next_seq += 1;
                 }
             }
             Ok(Event::Text(ref e)) if in_text => {
@@ -1087,11 +1064,16 @@ fn parse_modern_comments(xml: &str, authors: &HashMap<String, String>) -> Vec<Ra
 
 /// Build the slide-label `source` for a PPTX comment: `Slide N: Title` when the
 /// slide has a title, else `Slide N`.
+///
+/// The title's internal whitespace is collapsed (a multi-paragraph or
+/// `<a:br/>`-bearing title contains newlines) and the label is capped, so the
+/// rendered `- **source**:` line never breaks across multiple lines.
 fn slide_label(number: usize, title: Option<&str>) -> String {
-    match title {
-        Some(t) if !t.trim().is_empty() => format!("Slide {number}: {}", t.trim()),
+    let label = match title.map(comments::collapse_ws) {
+        Some(t) if !t.is_empty() => format!("Slide {number}: {t}"),
         _ => format!("Slide {number}"),
-    }
+    };
+    comments::cap_text(&label, comments::SOURCE_CAP)
 }
 
 /// Convert raw PPTX comments for one slide into rendered [`Comment`]s.
@@ -1158,11 +1140,11 @@ impl PptxConverter {
         // Load comment author registries (legacy + modern) once, if requested.
         let comment_authors = if options.extract_comments {
             let mut map = HashMap::new();
-            if let Some(xml) = read_zip_text(&mut archive, "ppt/commentAuthors.xml")? {
-                map.extend(parse_comment_authors_legacy(&xml));
+            if let Some(xml) = read_zip_text_lossy(&mut archive, "ppt/commentAuthors.xml")? {
+                map.extend(parse_author_registry(&xml, "cmAuthor"));
             }
-            if let Some(xml) = read_zip_text(&mut archive, "ppt/authors.xml")? {
-                map.extend(parse_authors_modern(&xml));
+            if let Some(xml) = read_zip_text_lossy(&mut archive, "ppt/authors.xml")? {
+                map.extend(parse_author_registry(&xml, "author"));
             }
             map
         } else {
@@ -1224,19 +1206,26 @@ impl PptxConverter {
                 let source = slide_label(slide_info.number, slide_title);
                 // Collect comment-part targets, sorted by path for deterministic
                 // ordering when a slide references more than one comment file.
+                // The modern scheme uses the office/2018/10 namespace; legacy
+                // uses the 2006 one.
                 let mut comment_targets: Vec<(String, bool)> = slide_rels
                     .values()
                     .filter(|rel| rel.rel_type.contains("comments"))
                     .map(|rel| {
                         let path = resolve_relative_to_file(&slide_info.path, &rel.target);
-                        // The modern scheme uses the office/2018/10 namespace;
-                        // legacy uses the 2006 one.
                         (path, rel.rel_type.contains("2018"))
                     })
                     .collect();
                 comment_targets.sort();
+                // A slide can carry BOTH a modern and a legacy comment part for
+                // back-compat, describing the same threads. Prefer modern and
+                // skip legacy in that case to avoid double-reporting.
+                let has_modern = comment_targets.iter().any(|(_, m)| *m);
                 for (path, is_modern) in comment_targets {
-                    let Some(xml) = read_zip_text(&mut archive, &path)? else {
+                    if has_modern && !is_modern {
+                        continue;
+                    }
+                    let Some(xml) = read_zip_text_lossy(&mut archive, &path)? else {
                         continue;
                     };
                     let raw = if is_modern {
@@ -2395,7 +2384,7 @@ mod tests {
     #[test]
     fn test_parse_comment_authors_legacy() {
         let xml = r#"<?xml version="1.0"?><p:cmAuthorLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cmAuthor id="0" name="Julie Lee" initials="JL"/><p:cmAuthor id="1" name="Sam Park" initials="SP"/></p:cmAuthorLst>"#;
-        let authors = parse_comment_authors_legacy(xml);
+        let authors = parse_author_registry(xml, "cmAuthor");
         assert_eq!(authors.get("0").map(|s| s.as_str()), Some("Julie Lee"));
         assert_eq!(authors.get("1").map(|s| s.as_str()), Some("Sam Park"));
     }
@@ -2403,7 +2392,7 @@ mod tests {
     #[test]
     fn test_parse_authors_modern() {
         let xml = r#"<?xml version="1.0"?><p188:authorLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main"><p188:author id="{GUID-1}" name="Julie Lee" initials="JL" userId="u1" providerId="AD"/></p188:authorLst>"#;
-        let authors = parse_authors_modern(xml);
+        let authors = parse_author_registry(xml, "author");
         assert_eq!(
             authors.get("{GUID-1}").map(|s| s.as_str()),
             Some("Julie Lee")
@@ -2459,6 +2448,43 @@ mod tests {
         );
         assert_eq!(slide_label(2, None), "Slide 2");
         assert_eq!(slide_label(3, Some("   ")), "Slide 3");
+    }
+
+    #[test]
+    fn test_slide_label_collapses_newline_in_title() {
+        // Finding 2: a multi-line title must not inject a newline that breaks the
+        // single-line `- **source**:` list item.
+        let label = slide_label(1, Some("Line1\nLine2"));
+        assert!(!label.contains('\n'), "label has a newline: {label:?}");
+        assert_eq!(label, "Slide 1: Line1 Line2");
+    }
+
+    #[test]
+    fn test_parse_legacy_comments_self_closing_text_no_leak() {
+        // Finding 5: self-closing <p:text/> must not capture stray sibling text.
+        let xml = r#"<?xml version="1.0"?><p:cmLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cm authorId="0" dt="d"><p:text/></p:cm></p:cmLst>"#;
+        let authors = HashMap::new();
+        let raw = parse_legacy_comments(xml, &authors);
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].body, "");
+    }
+
+    #[test]
+    fn test_parse_modern_comments_self_closing_text_no_leak() {
+        // Finding 5: self-closing <a:t/> must not leak text into the body.
+        let xml = r#"<?xml version="1.0"?><p188:cmLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p188:cm authorId="a" created="c"><p188:txBody><a:p><a:r><a:t/></a:r><a:r><a:t>real</a:t></a:r></a:p></p188:txBody></p188:cm></p188:cmLst>"#;
+        let authors = HashMap::new();
+        let raw = parse_modern_comments(xml, &authors);
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].body, "real");
+    }
+
+    #[test]
+    fn test_parse_author_registry_unescapes_name() {
+        // Finding 8: author names must be XML-unescaped.
+        let xml = r#"<?xml version="1.0"?><p:cmAuthorLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cmAuthor id="0" name="Ben &amp; Jerry"/></p:cmAuthorLst>"#;
+        let authors = parse_author_registry(xml, "cmAuthor");
+        assert_eq!(authors.get("0").map(|s| s.as_str()), Some("Ben & Jerry"));
     }
 
     // -- integration: build a PPTX with comment parts --
@@ -2620,5 +2646,60 @@ mod tests {
         assert!(result.plain_text.contains("source: Slide 1: Overview"));
         assert!(!result.plain_text.contains("# Comments"));
         assert!(!result.plain_text.contains("**"));
+    }
+
+    #[test]
+    fn test_pptx_dual_scheme_no_double_report() {
+        // Finding 2: a slide referencing BOTH a legacy and a modern comment part
+        // (same thread, for back-compat) must not report the comment twice.
+        use std::io::Write;
+        use zip::ZipWriter;
+        use zip::write::SimpleFileOptions;
+
+        let buf = Vec::new();
+        let mut zip = ZipWriter::new(Cursor::new(buf));
+        let opts = SimpleFileOptions::default();
+
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>"#).unwrap();
+        zip.start_file("ppt/presentation.xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#).unwrap();
+        zip.start_file("ppt/_rels/presentation.xml.rels", opts)
+            .unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#).unwrap();
+        zip.start_file("ppt/slides/slide1.xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree/></p:cSld></p:sld>"#).unwrap();
+        // Slide rels carry BOTH a legacy and a modern comments relationship.
+        zip.start_file("ppt/slides/_rels/slide1.xml.rels", opts)
+            .unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdL" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments/comment1.xml"/><Relationship Id="rIdM" Type="http://schemas.microsoft.com/office/2018/10/relationships/comments" Target="../comments/modernComment_x.xml"/></Relationships>"#).unwrap();
+        zip.start_file("ppt/commentAuthors.xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><p:cmAuthorLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cmAuthor id="0" name="Dana"/></p:cmAuthorLst>"#).unwrap();
+        zip.start_file("ppt/comments/comment1.xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><p:cmLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cm authorId="0" dt="d" idx="1"><p:text>Shared thread.</p:text></p:cm></p:cmLst>"#).unwrap();
+        zip.start_file("ppt/authors.xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><p188:authorLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main"><p188:author id="{A}" name="Dana" userId="u" providerId="AD"/></p188:authorLst>"#).unwrap();
+        zip.start_file("ppt/comments/modernComment_x.xml", opts)
+            .unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><p188:cmLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p188:cm authorId="{A}" created="c"><p188:txBody><a:p><a:r><a:t>Shared thread.</a:t></a:r></a:p></p188:txBody></p188:cm></p188:cmLst>"#).unwrap();
+
+        let data = zip.finish().unwrap().into_inner();
+        let options = ConversionOptions {
+            extract_comments: true,
+            ..Default::default()
+        };
+        let result = PptxConverter.convert(&data, &options).unwrap();
+        // Exactly one comment, not two.
+        assert_eq!(
+            result
+                .markdown
+                .matches("- **comment**: Shared thread.")
+                .count(),
+            1,
+            "comment double-reported, md: {}",
+            result.markdown
+        );
+        assert!(result.markdown.contains("## 1"));
+        assert!(!result.markdown.contains("## 2"));
     }
 }

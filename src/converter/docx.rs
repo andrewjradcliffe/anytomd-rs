@@ -26,7 +26,7 @@ use crate::markdown::{
     build_table, build_table_plain, format_heading, format_list_item, format_list_item_plain,
     wrap_formatting,
 };
-use crate::zip_utils::{read_zip_bytes, read_zip_text};
+use crate::zip_utils::{read_zip_bytes, read_zip_text, read_zip_text_lossy};
 
 /// Converts DOCX files to Markdown.
 pub struct DocxConverter;
@@ -1182,10 +1182,17 @@ fn parse_comments_xml(xml: &str) -> HashMap<String, RawComment> {
     let mut last_para_id: Option<String> = None;
     let mut para_count: usize = 0;
     let mut in_text = false;
+    // Depth of nested tables; w14:paraId is only meaningful on the comment's
+    // top-level paragraphs (commentsExtended threads on the last of those), so
+    // paraIds inside table cells must be ignored.
+    let mut table_depth: u32 = 0;
 
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+            // Only Event::Start sets in_text: a self-closing `<w:t/>` arrives as
+            // Event::Empty with no matching End, so handling it here would leave
+            // in_text stuck true and leak later text into the body.
+            Ok(Event::Start(ref e)) => {
                 let local = e.local_name();
                 let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
                 match local_str {
@@ -1196,36 +1203,53 @@ fn parse_comments_xml(xml: &str) -> HashMap<String, RawComment> {
                         cur_body = String::new();
                         last_para_id = None;
                         para_count = 0;
-                        for attr in e.attributes().flatten() {
-                            let k = attr.key.local_name();
-                            let k = std::str::from_utf8(k.as_ref()).unwrap_or("");
-                            let v = String::from_utf8_lossy(&attr.value).to_string();
-                            match k {
-                                "id" => cur_id = Some(v),
-                                "author" => cur_author = v,
-                                "date" => cur_date = v,
-                                _ => {}
-                            }
+                        table_depth = 0;
+                        if let Some(v) =
+                            crate::converter::ooxml_utils::attr_value_unescaped(e, "id")
+                        {
+                            cur_id = Some(v);
+                        }
+                        if let Some(v) =
+                            crate::converter::ooxml_utils::attr_value_unescaped(e, "author")
+                        {
+                            cur_author = v;
+                        }
+                        if let Some(v) =
+                            crate::converter::ooxml_utils::attr_value_unescaped(e, "date")
+                        {
+                            cur_date = v;
                         }
                     }
+                    "tbl" if cur_id.is_some() => table_depth += 1,
                     "p" if cur_id.is_some() => {
                         // Separate paragraphs with a newline (collapsed later).
                         if para_count > 0 {
                             cur_body.push('\n');
                         }
                         para_count += 1;
-                        // Capture w14:paraId (last one wins).
-                        for attr in e.attributes().flatten() {
-                            let k = attr.key.local_name();
-                            let k = std::str::from_utf8(k.as_ref()).unwrap_or("");
-                            if k == "paraId" {
-                                last_para_id =
-                                    Some(String::from_utf8_lossy(&attr.value).to_string());
-                            }
+                        // Capture w14:paraId of top-level paragraphs only (last wins).
+                        if table_depth == 0
+                            && let Some(v) =
+                                crate::converter::ooxml_utils::attr_value_unescaped(e, "paraId")
+                        {
+                            last_para_id = Some(v);
                         }
                     }
                     "t" if cur_id.is_some() => in_text = true,
                     _ => {}
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                let local = e.local_name();
+                let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                // A self-closing top-level `<w:p .../>` still counts paraId.
+                if local_str == "p"
+                    && cur_id.is_some()
+                    && table_depth == 0
+                    && let Some(v) =
+                        crate::converter::ooxml_utils::attr_value_unescaped(e, "paraId")
+                {
+                    last_para_id = Some(v);
                 }
             }
             Ok(Event::Text(ref e)) if in_text => {
@@ -1236,6 +1260,7 @@ fn parse_comments_xml(xml: &str) -> HashMap<String, RawComment> {
                 let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
                 match local_str {
                     "t" => in_text = false,
+                    "tbl" if table_depth > 0 => table_depth -= 1,
                     "comment" => {
                         if let Some(id) = cur_id.take() {
                             comments.insert(
@@ -1317,14 +1342,72 @@ fn collect_ranges_in_part(xml: &str) -> (Vec<String>, HashMap<String, String>) {
     // Set of currently-open range ids; text events append to all of them.
     let mut open: HashSet<String> = HashSet::new();
 
-    // Skip mc:Choice branches (mirror body behavior).
+    // Skip mc:Choice branches for CONTENT (mirror body behavior), but range
+    // markers are still honored inside them (see below).
     let mut in_mc_choice = false;
     let mut mc_choice_depth: u32 = 0;
+    // Text is only captured inside a run, matching the body parser — a loose
+    // `<w:t>` outside `<w:r>` is not rendered, so it must not appear in source.
+    let mut in_run = false;
     let mut in_text = false;
 
-    let note_id = |order: &mut Vec<String>, seen: &mut HashSet<String>, id: String| {
-        if seen.insert(id.clone()) {
-            order.push(id);
+    // Per-range byte bound: a malformed range that is never closed (missing or
+    // misplaced commentRangeEnd) must not absorb the whole part. 4 bytes/char
+    // guarantees at least SOURCE_CAP chars survive for the later char-cap.
+    let cap_bytes = comments::SOURCE_CAP.saturating_mul(4);
+
+    // Append `s` to a range buffer, never exceeding `cap_bytes` total; the slice
+    // is cut on a char boundary so the buffer stays valid UTF-8.
+    let push_capped = |buf: &mut String, s: &str| {
+        if buf.len() >= cap_bytes {
+            return;
+        }
+        let mut room = cap_bytes - buf.len();
+        if room >= s.len() {
+            buf.push_str(s);
+        } else {
+            while room > 0 && !s.is_char_boundary(room) {
+                room -= 1;
+            }
+            buf.push_str(&s[..room]);
+        }
+    };
+
+    // Handle a comment range/reference marker. Returns true if `local_str` was a
+    // marker. Markers are honored even inside a skipped mc:Choice branch so that
+    // a range whose end lands there still closes (rather than leaking forever).
+    let handle_marker = |local_str: &str,
+                         e: &quick_xml::events::BytesStart,
+                         order: &mut Vec<String>,
+                         seen: &mut HashSet<String>,
+                         open: &mut HashSet<String>| {
+        // Record an id in first-appearance order.
+        let note_id = |order: &mut Vec<String>, seen: &mut HashSet<String>, id: String| {
+            if seen.insert(id.clone()) {
+                order.push(id);
+            }
+        };
+        match local_str {
+            "commentRangeStart" => {
+                if let Some(id) = range_id(e) {
+                    note_id(order, seen, id.clone());
+                    open.insert(id);
+                }
+                true
+            }
+            "commentRangeEnd" => {
+                if let Some(id) = range_id(e) {
+                    open.remove(&id);
+                }
+                true
+            }
+            "commentReference" => {
+                if let Some(id) = range_id(e) {
+                    note_id(order, seen, id);
+                }
+                true
+            }
+            _ => false,
         }
     };
 
@@ -1333,6 +1416,9 @@ fn collect_ranges_in_part(xml: &str) -> (Vec<String>, HashMap<String, String>) {
             Ok(Event::Start(ref e)) => {
                 let local = e.local_name();
                 let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                if handle_marker(local_str, e, &mut order, &mut seen, &mut open) {
+                    continue;
+                }
                 if in_mc_choice {
                     mc_choice_depth += 1;
                     continue;
@@ -1342,61 +1428,30 @@ fn collect_ranges_in_part(xml: &str) -> (Vec<String>, HashMap<String, String>) {
                         in_mc_choice = true;
                         mc_choice_depth = 1;
                     }
-                    "commentRangeStart" => {
-                        if let Some(id) = range_id(e) {
-                            note_id(&mut order, &mut seen, id.clone());
-                            open.insert(id);
-                        }
-                    }
-                    "commentRangeEnd" => {
-                        if let Some(id) = range_id(e) {
-                            open.remove(&id);
-                        }
-                    }
-                    "commentReference" => {
-                        if let Some(id) = range_id(e) {
-                            note_id(&mut order, &mut seen, id);
-                        }
-                    }
+                    "r" => in_run = true,
                     "t" => in_text = true,
                     _ => {}
                 }
             }
             Ok(Event::Empty(ref e)) => {
+                let local = e.local_name();
+                let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                if handle_marker(local_str, e, &mut order, &mut seen, &mut open) {
+                    continue;
+                }
                 if in_mc_choice {
                     continue;
                 }
-                let local = e.local_name();
-                let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
-                match local_str {
-                    "commentRangeStart" => {
-                        if let Some(id) = range_id(e) {
-                            note_id(&mut order, &mut seen, id.clone());
-                            open.insert(id);
-                        }
+                if local_str == "br" && in_run && !open.is_empty() {
+                    for id in &open {
+                        push_capped(text.entry(id.clone()).or_default(), " ");
                     }
-                    "commentRangeEnd" => {
-                        if let Some(id) = range_id(e) {
-                            open.remove(&id);
-                        }
-                    }
-                    "commentReference" => {
-                        if let Some(id) = range_id(e) {
-                            note_id(&mut order, &mut seen, id);
-                        }
-                    }
-                    "br" if !open.is_empty() => {
-                        for id in &open {
-                            text.entry(id.clone()).or_default().push(' ');
-                        }
-                    }
-                    _ => {}
                 }
             }
-            Ok(Event::Text(ref e)) if in_text && !open.is_empty() => {
-                let t = e.unescape().unwrap_or_default().to_string();
+            Ok(Event::Text(ref e)) if in_text && in_run && !open.is_empty() => {
+                let t = e.unescape().unwrap_or_default();
                 for id in &open {
-                    text.entry(id.clone()).or_default().push_str(&t);
+                    push_capped(text.entry(id.clone()).or_default(), &t);
                 }
             }
             Ok(Event::End(ref e)) => {
@@ -1409,8 +1464,13 @@ fn collect_ranges_in_part(xml: &str) -> (Vec<String>, HashMap<String, String>) {
                     }
                     continue;
                 }
-                if local_str == "t" {
-                    in_text = false;
+                match local_str {
+                    "t" => in_text = false,
+                    "r" => {
+                        in_run = false;
+                        in_text = false;
+                    }
+                    _ => {}
                 }
             }
             Ok(Event::Eof) => break,
@@ -1492,9 +1552,16 @@ fn assemble_docx_comments(
         .keys()
         .filter(|id| !anchored_seen.contains(*id))
         .collect();
-    orphan_ids.sort_by(|a, b| match (a.parse::<u64>(), b.parse::<u64>()) {
-        (Ok(x), Ok(y)) => x.cmp(&y),
-        _ => a.cmp(b),
+    // Sort by (numeric value, original string) so the comparator is a total
+    // order even with a mix of numeric and non-numeric ids: all parseable ids
+    // sort numerically and ahead of any non-numeric ones (None > Some), with the
+    // string as a stable tiebreaker.
+    orphan_ids.sort_by_key(|id| {
+        (
+            id.parse::<u64>().ok().is_none(),
+            id.parse::<u64>().ok(),
+            (*id).clone(),
+        )
     });
     for id in orphan_ids {
         if let Some(rc) = raw.get(id) {
@@ -1536,7 +1603,9 @@ fn extract_docx_comments(
     body_xml: &str,
     warnings: &mut Vec<ConversionWarning>,
 ) -> Result<Vec<Comment>, ConvertError> {
-    let comments_xml = match read_zip_text(archive, "word/comments.xml")? {
+    // Comment parts are read leniently (lossy UTF-8): a malformed sub-part must
+    // not abort the whole document conversion (best-effort principle).
+    let comments_xml = match read_zip_text_lossy(archive, "word/comments.xml")? {
         Some(xml) => xml,
         None => return Ok(Vec::new()),
     };
@@ -1545,7 +1614,7 @@ fn extract_docx_comments(
         return Ok(Vec::new());
     }
 
-    let reply_para_ids = match read_zip_text(archive, "word/commentsExtended.xml")? {
+    let reply_para_ids = match read_zip_text_lossy(archive, "word/commentsExtended.xml")? {
         Some(xml) => parse_comments_extended(&xml),
         None => HashSet::new(),
     };
@@ -1572,12 +1641,12 @@ fn extract_docx_comments(
     let mut part_results: Vec<(Vec<String>, HashMap<String, String>)> = Vec::new();
     part_results.push(collect_ranges_in_part(body_xml));
     for path in headers.iter().chain(footers.iter()) {
-        if let Some(xml) = read_zip_text(archive, path)? {
+        if let Some(xml) = read_zip_text_lossy(archive, path)? {
             part_results.push(collect_ranges_in_part(&xml));
         }
     }
     for path in ["word/footnotes.xml", "word/endnotes.xml"] {
-        if let Some(xml) = read_zip_text(archive, path)? {
+        if let Some(xml) = read_zip_text_lossy(archive, path)? {
             part_results.push(collect_ranges_in_part(&xml));
         }
     }
@@ -3483,6 +3552,20 @@ mod tests {
     /// Build a DOCX with an arbitrary set of extra parts (e.g. comments.xml,
     /// headers, footnotes) in addition to document.xml.
     fn build_test_docx_with_parts(document_xml: &str, extra_parts: &[(&str, &str)]) -> Vec<u8> {
+        let byte_parts: Vec<(&str, Vec<u8>)> = extra_parts
+            .iter()
+            .map(|(p, c)| (*p, c.as_bytes().to_vec()))
+            .collect();
+        let refs: Vec<(&str, &[u8])> = byte_parts.iter().map(|(p, c)| (*p, c.as_slice())).collect();
+        build_test_docx_with_parts_bytes(document_xml, &refs)
+    }
+
+    /// Like `build_test_docx_with_parts`, but extra parts are raw bytes (so a
+    /// part can contain invalid UTF-8 for best-effort/lenient-decode tests).
+    fn build_test_docx_with_parts_bytes(
+        document_xml: &str,
+        extra_parts: &[(&str, &[u8])],
+    ) -> Vec<u8> {
         use std::io::Write;
         use zip::ZipWriter;
         use zip::write::SimpleFileOptions;
@@ -3506,7 +3589,7 @@ mod tests {
 
         for (path, content) in extra_parts {
             zip.start_file(*path, opts).unwrap();
-            zip.write_all(content.as_bytes()).unwrap();
+            zip.write_all(content).unwrap();
         }
 
         let cursor = zip.finish().unwrap();
@@ -3879,5 +3962,119 @@ mod tests {
         };
         let result = DocxConverter.convert(&data, &options).unwrap();
         assert!(!result.markdown.contains("# Comments"));
+    }
+
+    // ---- Regression tests for review findings ----
+
+    fn extract_opts() -> ConversionOptions {
+        ConversionOptions {
+            extract_comments: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_parse_comments_xml_self_closing_t_no_leak() {
+        // Finding 5: a self-closing <w:t/> (Empty event) must not leave in_text
+        // stuck true and capture stray text from later in the same comment.
+        let cx = r#"<?xml version="1.0"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="1" w:author="A"><w:p><w:r><w:t/></w:r><w:r><w:t>real</w:t></w:r></w:p></w:comment></w:comments>"#;
+        let parsed = parse_comments_xml(cx);
+        assert_eq!(parsed.get("1").unwrap().body, "real");
+    }
+
+    #[test]
+    fn test_parse_comments_xml_unescapes_author() {
+        // Finding 8: author/date attributes must be XML-unescaped.
+        let cx = r#"<?xml version="1.0"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="1" w:author="R&amp;D &lt;Team&gt;"><w:p><w:r><w:t>x</w:t></w:r></w:p></w:comment></w:comments>"#;
+        let parsed = parse_comments_xml(cx);
+        assert_eq!(parsed.get("1").unwrap().author, "R&D <Team>");
+    }
+
+    #[test]
+    fn test_parse_comments_xml_para_id_ignores_table_cells() {
+        // Finding 9: w14:paraId must come from the last TOP-LEVEL paragraph, not
+        // a nested table-cell paragraph.
+        let cx = r#"<?xml version="1.0"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w:comment w:id="1" w:author="A"><w:p w14:paraId="TOP">text</w:p><w:tbl><w:tr><w:tc><w:p w14:paraId="CELL"><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:comment></w:comments>"#;
+        let parsed = parse_comments_xml(cx);
+        assert_eq!(parsed.get("1").unwrap().para_id.as_deref(), Some("TOP"));
+    }
+
+    #[test]
+    fn test_collect_ranges_end_inside_mc_choice_closes() {
+        // Findings 1/3: a commentRangeEnd buried in a skipped mc:Choice must still
+        // close the range, so later text does not leak into the source.
+        let body = wrap_body(
+            r#"<w:p><w:commentRangeStart w:id="1"/><w:r><w:t>anchor</w:t></w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:commentRangeEnd w:id="1"/></mc:Choice><mc:Fallback><w:r><w:t>fb</w:t></w:r></mc:Fallback></mc:AlternateContent><w:r><w:commentReference w:id="1"/></w:r></w:p><w:p><w:r><w:t>UNRELATED LATER TEXT</w:t></w:r></w:p>"#,
+        );
+        let (_order, text) = collect_ranges_in_part(&body);
+        let src = text.get("1").cloned().unwrap_or_default();
+        assert!(src.contains("anchor"), "src: {src}");
+        assert!(
+            !src.contains("UNRELATED"),
+            "range leaked past its end: {src}"
+        );
+    }
+
+    #[test]
+    fn test_collect_ranges_unclosed_range_is_bounded() {
+        // Finding 1: a range with no commentRangeEnd at all must not absorb an
+        // unbounded amount of the part (bounded to SOURCE_CAP*4 bytes).
+        let huge = "x".repeat(5000);
+        let body = wrap_body(&format!(
+            r#"<w:p><w:commentRangeStart w:id="1"/><w:r><w:t>anchor</w:t></w:r><w:r><w:commentReference w:id="1"/></w:r></w:p><w:p><w:r><w:t>{huge}</w:t></w:r></w:p>"#
+        ));
+        let (_order, text) = collect_ranges_in_part(&body);
+        let src = text.get("1").cloned().unwrap_or_default();
+        // Bounded well under the 5000-char tail (cap is SOURCE_CAP*4 = 800 bytes).
+        assert!(
+            src.len() <= comments::SOURCE_CAP * 4 + 16,
+            "unbounded: {} bytes",
+            src.len()
+        );
+    }
+
+    #[test]
+    fn test_collect_ranges_ignores_loose_text_outside_run() {
+        // Finding 6: text outside a <w:r> is not rendered in the body, so it must
+        // not appear in the commented-on source either.
+        let body = wrap_body(
+            r#"<w:p><w:commentRangeStart w:id="1"/><w:t>loose no run</w:t><w:r><w:t>real</w:t></w:r><w:commentRangeEnd w:id="1"/><w:r><w:commentReference w:id="1"/></w:r></w:p>"#,
+        );
+        let (_order, text) = collect_ranges_in_part(&body);
+        let src = text.get("1").cloned().unwrap_or_default();
+        assert_eq!(
+            src, "real",
+            "loose text outside a run leaked into source: {src}"
+        );
+    }
+
+    #[test]
+    fn test_docx_comments_author_entity_end_to_end() {
+        // Finding 8 end-to-end: "R&D" renders as R&D, not R&amp;D.
+        let doc = body_with_comment_1();
+        let cx = comments_xml(&[("1", "R&amp;D Team", "2024-01-01T00:00:00Z", "note")]);
+        let data = build_test_docx_with_parts(&doc, &[("word/comments.xml", &cx)]);
+        let result = DocxConverter.convert(&data, &extract_opts()).unwrap();
+        assert!(
+            result.markdown.contains("- **author**: R&D Team"),
+            "md: {}",
+            result.markdown
+        );
+        assert!(!result.markdown.contains("R&amp;D"));
+    }
+
+    #[test]
+    fn test_docx_comments_malformed_part_does_not_abort() {
+        // Finding 4: a non-UTF-8 comments.xml must not abort conversion; the body
+        // still converts (best-effort).
+        let doc = wrap_body(&para("Body survives."));
+        // comments.xml referencing valid structure but with an invalid byte.
+        let mut cx = comments_xml(&[("1", "A", "2024-01-01T00:00:00Z", "ok")]).into_bytes();
+        cx.push(0xFF); // invalid UTF-8 trailing byte
+        let data = build_test_docx_with_parts_bytes(&doc, &[("word/comments.xml", &cx)]);
+        let result = DocxConverter.convert(&data, &extract_opts()).unwrap();
+        assert!(result.markdown.contains("Body survives."));
+        // Lossy decode still recovers the well-formed comment.
+        assert!(result.markdown.contains("# Comments"));
     }
 }

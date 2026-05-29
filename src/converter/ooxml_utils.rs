@@ -82,6 +82,28 @@ pub(crate) fn parse_relationships(xml: &str) -> HashMap<String, Relationship> {
     rels
 }
 
+/// Read an attribute by local name from an element, XML-unescaping the value.
+///
+/// Matches on the attribute's local name (ignoring any namespace prefix) and
+/// decodes entity references (`&amp;`, `&lt;`, …), falling back to a lossy
+/// decode if unescaping fails. Returns `None` if the attribute is absent.
+pub(crate) fn attr_value_unescaped(
+    e: &quick_xml::events::BytesStart,
+    local: &str,
+) -> Option<String> {
+    for attr in e.attributes().flatten() {
+        let key = attr.key.local_name();
+        if std::str::from_utf8(key.as_ref()).unwrap_or("") == local {
+            let val = attr
+                .unescape_value()
+                .map(|v| v.into_owned())
+                .unwrap_or_else(|_| String::from_utf8_lossy(attr.value.as_ref()).to_string());
+            return Some(val);
+        }
+    }
+    None
+}
+
 /// Derive the .rels path for a given file path.
 ///
 /// Example: `ppt/slides/slide1.xml` -> `ppt/slides/_rels/slide1.xml.rels`
@@ -284,6 +306,34 @@ pub(crate) async fn resolve_image_placeholders_async(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quick_xml::events::Event;
+
+    /// Read the first start/empty element from `xml` and run `f` on it.
+    fn with_first_element<R>(xml: &str, f: impl FnOnce(&quick_xml::events::BytesStart) -> R) -> R {
+        let mut reader = Reader::from_str(xml);
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => return f(e),
+                Ok(Event::Eof) => panic!("no element in {xml}"),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_attr_value_unescaped_decodes_entities() {
+        with_first_element(r#"<e a="R&amp;D &lt;ok&gt;"/>"#, |e| {
+            assert_eq!(attr_value_unescaped(e, "a").as_deref(), Some("R&D <ok>"));
+        });
+    }
+
+    #[test]
+    fn test_attr_value_unescaped_ignores_prefix_and_missing() {
+        with_first_element(r#"<e w:author="Jane"/>"#, |e| {
+            assert_eq!(attr_value_unescaped(e, "author").as_deref(), Some("Jane"));
+            assert_eq!(attr_value_unescaped(e, "missing"), None);
+        });
+    }
 
     #[test]
     fn test_parse_relationships_basic() {
