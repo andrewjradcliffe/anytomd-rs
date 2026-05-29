@@ -125,6 +125,8 @@ pub struct ConversionWarning {
 pub struct ConversionOptions {
     /// Extract embedded images into `ConversionResult.images`
     pub extract_images: bool,
+    /// Extract comments (DOCX/PPTX) into an appended `# Comments` section
+    pub extract_comments: bool,
     /// Hard cap for total extracted image bytes per document
     pub max_total_image_bytes: usize,
     /// If true, return an error on recoverable parse failures
@@ -281,6 +283,12 @@ word/_rels/document.xml.rels — relationship mappings (image refs)
 | Hyperlinks | `<w:hyperlink>` + rels | `[text](url)` |
 | Images | `<w:drawing>` + rels → media/ | Extract to `ConversionResult.images` |
 | Lists | `<w:numPr>` + numbering.xml | `- item` or `1. item` |
+| Comments (opt-in) | `comments.xml` + `commentRangeStart/End` in body/headers/footers/footnotes/endnotes; threads via `commentsExtended.xml` | Appended `# Comments` section |
+
+When `extract_comments` is set, comments are appended after the body as a
+`# Comments` section: per comment, the author + date, the comment body, and
+the commented-on text (`source`, collapsed and capped at 200 chars). Replies
+are flattened and marked `(reply)`.
 
 **MarkItDown comparison:**
 - MarkItDown: DOCX → HTML (via mammoth) → Markdown (via markdownify) — two conversion steps
@@ -306,6 +314,11 @@ ppt/media/*                — embedded images
 | Tables | `<a:tbl>` → `<a:tr>` → `<a:tc>` | Pipe-delimited MD table |
 | Speaker notes | `notesSlide{N}.xml` → `<a:t>` | `> Note: ...` (blockquote) |
 | Images | `<a:blip>` + rels → media/ | Extract to `ConversionResult.images` |
+| Comments (opt-in) | legacy `commentAuthors.xml` + `comments/comment{N}.xml`; modern `authors.xml` + `comments/modernComment_*.xml` (threaded) | Appended `# Comments` section |
+
+When `extract_comments` is set, both the legacy and modern comment schemes are
+parsed. Because PPTX comments are point-anchored (not text-anchored), the
+`source` for each comment is the slide label (`Slide N: Title`).
 
 **Output structure per slide:**
 ```markdown
