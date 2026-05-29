@@ -257,7 +257,10 @@ mod tests {
 
     #[test]
     fn test_body_display_reply_prefixed() {
-        assert_eq!(body_display(&c("A", "Agreed.", "src", true)), "(reply) Agreed.");
+        assert_eq!(
+            body_display(&c("A", "Agreed.", "src", true)),
+            "(reply) Agreed."
+        );
     }
 
     #[test]

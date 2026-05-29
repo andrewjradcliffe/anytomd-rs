@@ -84,6 +84,10 @@ struct Cli {
     #[arg(long)]
     plain_text: bool,
 
+    /// Extract comments (DOCX/PPTX only) into an appended Comments section.
+    #[arg(long)]
+    extract_comments: bool,
+
     /// Maximum input file size (e.g., "500MB", "2GiB"). [default: 8GiB]
     #[arg(long, value_name = "SIZE", value_parser = crate::parse::byte_size)]
     max_input_size: Option<usize>,
@@ -118,6 +122,7 @@ fn build_options(cli: &Cli) -> Result<ConversionOptions, ExitCode> {
     let d = ConversionOptions::default();
     let mut options = ConversionOptions {
         strict: cli.strict,
+        extract_comments: cli.extract_comments,
         max_input_bytes: cli.max_input_size.unwrap_or(d.max_input_bytes),
         max_total_image_bytes: cli.max_image_size.unwrap_or(d.max_total_image_bytes),
         max_uncompressed_zip_bytes: cli.max_zip_size.unwrap_or(d.max_uncompressed_zip_bytes),

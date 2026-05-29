@@ -1488,7 +1488,10 @@ fn assemble_docx_comments(
     }
 
     // 2. Orphan comments (no anchor), in comments.xml id order (numeric when possible).
-    let mut orphan_ids: Vec<&String> = raw.keys().filter(|id| !anchored_seen.contains(*id)).collect();
+    let mut orphan_ids: Vec<&String> = raw
+        .keys()
+        .filter(|id| !anchored_seen.contains(*id))
+        .collect();
     orphan_ids.sort_by(|a, b| match (a.parse::<u64>(), b.parse::<u64>()) {
         (Ok(x), Ok(y)) => x.cmp(&y),
         _ => a.cmp(b),
@@ -3631,15 +3634,27 @@ mod tests {
             ..Default::default()
         };
         let result = DocxConverter.convert(&data, &options).unwrap();
-        assert!(result.markdown.contains("# Comments"), "md: {}", result.markdown);
+        assert!(
+            result.markdown.contains("# Comments"),
+            "md: {}",
+            result.markdown
+        );
         assert!(result.markdown.contains("## 1"));
         assert!(
             result
                 .markdown
                 .contains("- **author**: Jane Smith (2024-01-15T09:30:00Z)")
         );
-        assert!(result.markdown.contains("- **comment**: Please revise this."));
-        assert!(result.markdown.contains("- **source**: the quick brown fox"));
+        assert!(
+            result
+                .markdown
+                .contains("- **comment**: Please revise this.")
+        );
+        assert!(
+            result
+                .markdown
+                .contains("- **source**: the quick brown fox")
+        );
         // Body content is preserved above the section.
         assert!(result.markdown.contains("Intro paragraph."));
         let body_pos = result.markdown.find("Intro paragraph.").unwrap();
@@ -3671,7 +3686,11 @@ mod tests {
         };
         let result = DocxConverter.convert(&data, &options).unwrap();
         assert!(result.plain_text.contains("Comments\n"));
-        assert!(result.plain_text.contains("author: Jane Smith (2024-01-15T09:30:00Z)"));
+        assert!(
+            result
+                .plain_text
+                .contains("author: Jane Smith (2024-01-15T09:30:00Z)")
+        );
         assert!(result.plain_text.contains("comment: Revise."));
         assert!(result.plain_text.contains("source: the quick brown fox"));
         // No markdown markers in the appended plain-text section.
@@ -3690,7 +3709,11 @@ mod tests {
             ..Default::default()
         };
         let result = DocxConverter.convert(&data, &options).unwrap();
-        assert!(result.markdown.contains("- **author**: Unknown"), "md: {}", result.markdown);
+        assert!(
+            result.markdown.contains("- **author**: Unknown"),
+            "md: {}",
+            result.markdown
+        );
     }
 
     #[test]
@@ -3740,7 +3763,11 @@ mod tests {
         // The source line is capped to 200 x's + ellipsis (the full 300-char run
         // still appears in the body paragraph, so we check the source line only).
         let expected = format!("- **source**: {}…", "x".repeat(200));
-        assert!(result.markdown.contains(&expected), "md: {}", result.markdown);
+        assert!(
+            result.markdown.contains(&expected),
+            "md: {}",
+            result.markdown
+        );
         let source_line = result
             .markdown
             .lines()
@@ -3766,9 +3793,17 @@ mod tests {
         let result = DocxConverter.convert(&data, &options).unwrap();
         let anchored = result.markdown.find("Has anchor").unwrap();
         let orphan = result.markdown.find("No anchor").unwrap();
-        assert!(anchored < orphan, "orphan must come last, md: {}", result.markdown);
+        assert!(
+            anchored < orphan,
+            "orphan must come last, md: {}",
+            result.markdown
+        );
         // Orphan's source is empty.
-        assert!(result.markdown.contains("- **comment**: No anchor\n- **source**: \n"));
+        assert!(
+            result
+                .markdown
+                .contains("- **comment**: No anchor\n- **source**: \n")
+        );
     }
 
     #[test]
@@ -3782,14 +3817,16 @@ mod tests {
         );
         let cx = comments_xml(&[
             ("1", "BodyAuthor", "2024-01-01T00:00:00Z", "Body comment"),
-            ("2", "HeaderAuthor", "2024-01-02T00:00:00Z", "Header comment"),
+            (
+                "2",
+                "HeaderAuthor",
+                "2024-01-02T00:00:00Z",
+                "Header comment",
+            ),
         ]);
         let data = build_test_docx_with_parts(
             &doc,
-            &[
-                ("word/comments.xml", &cx),
-                ("word/header1.xml", &header),
-            ],
+            &[("word/comments.xml", &cx), ("word/header1.xml", &header)],
         );
         let options = ConversionOptions {
             extract_comments: true,
@@ -3798,7 +3835,10 @@ mod tests {
         let result = DocxConverter.convert(&data, &options).unwrap();
         let body_c = result.markdown.find("Body comment").unwrap();
         let header_c = result.markdown.find("Header comment").unwrap();
-        assert!(body_c < header_c, "body comment must precede header comment");
+        assert!(
+            body_c < header_c,
+            "body comment must precede header comment"
+        );
         assert!(result.markdown.contains("- **source**: header anchor"));
     }
 

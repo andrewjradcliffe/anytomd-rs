@@ -2404,7 +2404,10 @@ mod tests {
     fn test_parse_authors_modern() {
         let xml = r#"<?xml version="1.0"?><p188:authorLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main"><p188:author id="{GUID-1}" name="Julie Lee" initials="JL" userId="u1" providerId="AD"/></p188:authorLst>"#;
         let authors = parse_authors_modern(xml);
-        assert_eq!(authors.get("{GUID-1}").map(|s| s.as_str()), Some("Julie Lee"));
+        assert_eq!(
+            authors.get("{GUID-1}").map(|s| s.as_str()),
+            Some("Julie Lee")
+        );
     }
 
     // -- unit: comment files --
@@ -2450,7 +2453,10 @@ mod tests {
 
     #[test]
     fn test_slide_label() {
-        assert_eq!(slide_label(2, Some("Quarterly Results")), "Slide 2: Quarterly Results");
+        assert_eq!(
+            slide_label(2, Some("Quarterly Results")),
+            "Slide 2: Quarterly Results"
+        );
         assert_eq!(slide_label(2, None), "Slide 2");
         assert_eq!(slide_label(3, Some("   ")), "Slide 3");
     }
@@ -2474,7 +2480,8 @@ mod tests {
         // presentation.xml + rels
         zip.start_file("ppt/presentation.xml", opts).unwrap();
         zip.write_all(br#"<?xml version="1.0"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#).unwrap();
-        zip.start_file("ppt/_rels/presentation.xml.rels", opts).unwrap();
+        zip.start_file("ppt/_rels/presentation.xml.rels", opts)
+            .unwrap();
         zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#).unwrap();
 
         // slide1.xml
@@ -2502,7 +2509,8 @@ mod tests {
                 "../comments/comment1.xml",
             )
         };
-        zip.start_file("ppt/slides/_rels/slide1.xml.rels", opts).unwrap();
+        zip.start_file("ppt/slides/_rels/slide1.xml.rels", opts)
+            .unwrap();
         zip.write_all(
             format!(
                 r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdC" Type="{rel_type}" Target="{comment_path}"/></Relationships>"#
@@ -2514,7 +2522,8 @@ mod tests {
         if modern {
             zip.start_file("ppt/authors.xml", opts).unwrap();
             zip.write_all(br#"<?xml version="1.0"?><p188:authorLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main"><p188:author id="{A1}" name="Alice" userId="u" providerId="AD"/><p188:author id="{A2}" name="Bob" userId="u" providerId="AD"/></p188:authorLst>"#).unwrap();
-            zip.start_file("ppt/comments/modernComment_x.xml", opts).unwrap();
+            zip.start_file("ppt/comments/modernComment_x.xml", opts)
+                .unwrap();
             zip.write_all(br#"<?xml version="1.0"?><p188:cmLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p188:cm id="{C1}" authorId="{A1}" created="2024-01-15T10:30:00.000"><p188:replyLst><p188:reply id="{C2}" authorId="{A2}" created="2024-01-15T11:00:00.000"><p188:txBody><a:bodyPr/><a:p><a:r><a:t>Agreed.</a:t></a:r></a:p></p188:txBody></p188:reply></p188:replyLst><p188:txBody><a:bodyPr/><a:p><a:r><a:t>Please clarify.</a:t></a:r></a:p></p188:txBody></p188:cm></p188:cmLst>"#).unwrap();
         } else {
             zip.start_file("ppt/commentAuthors.xml", opts).unwrap();
@@ -2535,14 +2544,22 @@ mod tests {
             ..Default::default()
         };
         let result = PptxConverter.convert(&data, &options).unwrap();
-        assert!(result.markdown.contains("# Comments"), "md: {}", result.markdown);
+        assert!(
+            result.markdown.contains("# Comments"),
+            "md: {}",
+            result.markdown
+        );
         assert!(result.markdown.contains("## 1"));
         assert!(
             result
                 .markdown
                 .contains("- **author**: Julie Lee (2024-01-15T10:30:00.000)")
         );
-        assert!(result.markdown.contains("- **comment**: Add a diagram here."));
+        assert!(
+            result
+                .markdown
+                .contains("- **comment**: Add a diagram here.")
+        );
         assert!(result.markdown.contains("- **source**: Slide 1: Overview"));
     }
 
@@ -2554,7 +2571,11 @@ mod tests {
             ..Default::default()
         };
         let result = PptxConverter.convert(&data, &options).unwrap();
-        assert!(result.markdown.contains("# Comments"), "md: {}", result.markdown);
+        assert!(
+            result.markdown.contains("# Comments"),
+            "md: {}",
+            result.markdown
+        );
         assert!(result.markdown.contains("- **comment**: Please clarify."));
         assert!(
             result.markdown.contains("- **comment**: (reply) Agreed."),
@@ -2564,7 +2585,11 @@ mod tests {
         // Parent comment must be emitted before its reply (document order).
         let parent = result.markdown.find("Please clarify.").unwrap();
         let reply = result.markdown.find("(reply) Agreed.").unwrap();
-        assert!(parent < reply, "parent must precede reply, md: {}", result.markdown);
+        assert!(
+            parent < reply,
+            "parent must precede reply, md: {}",
+            result.markdown
+        );
         // No slide title -> bare "Slide 1".
         assert!(result.markdown.contains("- **source**: Slide 1\n"));
     }
@@ -2587,7 +2612,11 @@ mod tests {
         };
         let result = PptxConverter.convert(&data, &options).unwrap();
         assert!(result.plain_text.contains("Comments\n"));
-        assert!(result.plain_text.contains("author: Julie Lee (2024-01-15T10:30:00.000)"));
+        assert!(
+            result
+                .plain_text
+                .contains("author: Julie Lee (2024-01-15T10:30:00.000)")
+        );
         assert!(result.plain_text.contains("source: Slide 1: Overview"));
         assert!(!result.plain_text.contains("# Comments"));
         assert!(!result.plain_text.contains("**"));
