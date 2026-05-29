@@ -5,6 +5,7 @@
 //! are re-exported from the crate root.
 
 pub mod code;
+pub(crate) mod comments;
 pub mod csv;
 pub mod docx;
 pub mod gemini;
@@ -82,6 +83,9 @@ pub struct ConversionWarning {
 pub struct ConversionOptions {
     /// Extract embedded images into `ConversionResult.images`.
     pub extract_images: bool,
+    /// Extract document comments (DOCX/PPTX only) into an appended
+    /// `# Comments` section. Ignored for formats without comments.
+    pub extract_comments: bool,
     /// Hard cap for total extracted image bytes per document.
     pub max_total_image_bytes: usize,
     /// If true, return an error on recoverable parse failures instead of warnings.
@@ -98,6 +102,7 @@ impl std::fmt::Debug for ConversionOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConversionOptions")
             .field("extract_images", &self.extract_images)
+            .field("extract_comments", &self.extract_comments)
             .field("max_total_image_bytes", &self.max_total_image_bytes)
             .field("strict", &self.strict)
             .field("max_input_bytes", &self.max_input_bytes)
@@ -117,6 +122,7 @@ impl Default for ConversionOptions {
     fn default() -> Self {
         Self {
             extract_images: false,
+            extract_comments: false,
             max_total_image_bytes: 4_usize.saturating_mul(1024 * 1024 * 1024), // 4 GiB (usize::MAX on 32-bit)
             strict: false,
             max_input_bytes: 8_usize.saturating_mul(1024 * 1024 * 1024), // 8 GiB (usize::MAX on 32-bit)
@@ -475,6 +481,11 @@ mod tests {
     fn test_conversion_options_default_has_no_describer() {
         let opts = ConversionOptions::default();
         assert!(opts.image_describer.is_none());
+    }
+
+    #[test]
+    fn test_conversion_options_default_extract_comments_false() {
+        assert!(!ConversionOptions::default().extract_comments);
     }
 
     #[test]

@@ -326,7 +326,8 @@ pub async fn convert_bytes_async(
         match extension_norm.as_str() {
             "docx" => {
                 let conv = converter::docx::DocxConverter;
-                let (mut result, pending) = conv.convert_inner(data, &options.base)?;
+                let (mut result, pending, doc_comments) =
+                    conv.convert_inner(data, &options.base)?;
                 if !pending.infos.is_empty() {
                     converter::ooxml_utils::resolve_image_placeholders_async(
                         &mut result.markdown,
@@ -338,6 +339,11 @@ pub async fn convert_bytes_async(
                     )
                     .await;
                 }
+                converter::comments::append_comments(
+                    &mut result.markdown,
+                    &mut result.plain_text,
+                    &doc_comments,
+                );
                 return enforce_strict_mode(result, options.base.strict);
             }
             "pptx" => {
