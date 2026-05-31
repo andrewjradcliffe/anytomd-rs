@@ -1,0 +1,35 @@
+name: crates.io publish
+
+# Publishes the crate to crates.io when a GitHub release is published. Pairs
+# with `npm-publish.yml` (same trigger), so a single `gh release create` fans
+# out to both registries. Publishing from a clean CI checkout — rather than a
+# local working tree — structurally prevents the untracked-file leak class that
+# affected v1.2.1 (see CLAUDE.md "Release Management").
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify release tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          echo "release tag: $GITHUB_REF_NAME (normalized: $tag) | Cargo.toml: $pkg"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::release tag 'v$tag' does not match Cargo.toml version '$pkg' — refusing to publish"
+            exit 1
+          fi
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
