@@ -298,13 +298,16 @@ Follow all steps in order — do not skip any.
 3. **Bump version in `Cargo.toml`** — update `version = "..."` in `[package]`
 4. **Create PR** — branch `chore/release-vX.Y.Z`, commit message `chore: release vX.Y.Z`
 5. **Merge PR** — follow standard PR Merge Procedure above
-6. **Publish to crates.io** — from `main` after merge: `cargo publish`
-7. **Create GitHub release** — `gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes --latest` (from `main` at the merge commit)
-8. **Verify sync** — confirm `cargo search anytomd` matches the GitHub release tag and `Cargo.toml`
+6. **Create the GitHub release (this triggers publishing)** — from `main` at the merge commit: `gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes --latest`. Publishing is automated by GitHub Actions on the `release: published` event:
+   - `.github/workflows/release.yml` runs `cargo publish` to crates.io (after verifying the release tag matches `Cargo.toml`).
+   - `.github/workflows/npm-publish.yml` builds the WASM package and publishes it to npm.
+
+   Do **not** run `cargo publish` locally — the workflow publishes from a clean CI checkout, which structurally prevents the untracked-file leak class (see below). Requires the `CARGO_REGISTRY_TOKEN` and `NPM_TOKEN` repository secrets.
+7. **Verify both registries** — watch the runs (`gh run watch`), then confirm `cargo search anytomd` and `npm view anytomd version` both match the release tag and `Cargo.toml`. If a publish job fails (e.g. transient registry error), fix the cause and re-run the failed job from the Actions UI — the re-run reuses the release context.
 
 ### Pre-publish Safety Checks
 
-**Mandatory before step 6 (`cargo publish`).** Skipping these has historically leaked credentials — treat as non-negotiable.
+Publishing now happens from a clean CI checkout (step 6), so the untracked-working-tree leak class is structurally unreachable in the normal flow, and the `security` CI job still audits `cargo package --list` on every push/PR. The rules below remain **mandatory** for any manual `cargo publish` — an escape hatch only; the normal flow is the GitHub release. Skipping them has historically leaked credentials — treat as non-negotiable.
 
 1. **Working tree must be clean.** `git status --short` must produce no output. If untracked files appear (local IDE/tooling state, scratch files, generated artifacts), add them to `.gitignore` in a **separate PR** before publishing. Never proceed with `--allow-dirty` to "just get past it."
 2. **Audit the package contents.** Run:
@@ -318,9 +321,9 @@ Follow all steps in order — do not skip any.
 
 ### Version Sync Rules
 
-- **One version, three places**: `Cargo.toml` (source of truth) = crates.io = GitHub release tag
-- **Never publish to crates.io without a matching GitHub release** and vice versa
-- **Never manually edit crates.io metadata** — always go through `Cargo.toml` + `cargo publish`
+- **One version, four places**: `Cargo.toml` (source of truth) = crates.io = npm = GitHub release tag (the npm version is derived from `Cargo.toml` by `wasm-pack`)
+- **The GitHub release is the single publish trigger** — creating it publishes to crates.io and npm; never publish to either without the matching GitHub release
+- **Never manually edit crates.io metadata** — always go through `Cargo.toml` + the automated release workflow
 - **Tag format**: always `vX.Y.Z` (e.g., `v0.6.0`), created automatically by `gh release create`
 - **Cargo.lock**: committed to the repo for reproducible builds; updated automatically by version bump
 - If a release is partially completed (e.g., crates.io published but GitHub release missing), fix immediately — do not leave versions out of sync
