@@ -42,6 +42,25 @@ pub(crate) fn read_zip_text(
     Ok(Some(buf))
 }
 
+/// Read a text file from a ZIP archive with a lossy UTF-8 decode.
+///
+/// Unlike [`read_zip_text`], invalid UTF-8 bytes are replaced with U+FFFD rather
+/// than returning an error. Used for best-effort, opt-in parts (e.g. comments)
+/// where a single malformed sub-part must not abort the whole conversion.
+pub(crate) fn read_zip_text_lossy(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    path: &str,
+) -> Result<Option<String>, ConvertError> {
+    let mut file = match archive.by_name(path) {
+        Ok(f) => f,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(e) => return Err(ConvertError::ZipError(e)),
+    };
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+}
+
 /// Read raw bytes from a ZIP archive, returning None if not found.
 pub(crate) fn read_zip_bytes(
     archive: &mut ZipArchive<Cursor<&[u8]>>,

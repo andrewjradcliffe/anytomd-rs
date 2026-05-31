@@ -6,13 +6,14 @@
 //! `v:textbox` / `w:txbxContent`). Text boxes wrapped in `mc:AlternateContent` are
 //! handled by skipping the `mc:Choice` branch and processing `mc:Fallback` (VML).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use zip::ZipArchive;
 
+use crate::converter::comments::{self, Comment};
 use crate::converter::ooxml_utils::{
     ImageInfo, PendingImageResolution, Relationship, parse_relationships,
     resolve_image_placeholders, resolve_relative_to_file,
@@ -25,7 +26,7 @@ use crate::markdown::{
     build_table, build_table_plain, format_heading, format_list_item, format_list_item_plain,
     wrap_formatting,
 };
-use crate::zip_utils::{read_zip_bytes, read_zip_text};
+use crate::zip_utils::{read_zip_bytes, read_zip_text, read_zip_text_lossy};
 
 /// Converts DOCX files to Markdown.
 pub struct DocxConverter;
@@ -1152,18 +1153,526 @@ fn finalize_paragraph(
     }
 }
 
+// ---- Comment extraction ----
+
+/// A raw comment parsed from `word/comments.xml`, before assembly into a
+/// rendered [`Comment`].
+#[derive(Debug, Clone)]
+struct RawComment {
+    author: String,
+    date: String,
+    body: String,
+    /// The `w14:paraId` of the comment's last paragraph, used to link a comment
+    /// to its reply metadata in `commentsExtended.xml`.
+    para_id: Option<String>,
+}
+
+/// Parse `word/comments.xml` into a map from comment id to its raw content.
+///
+/// Captures `w:author`, `w:date`, the concatenated body text (paragraphs joined
+/// by newline, later collapsed), and the `w14:paraId` of the final paragraph.
+fn parse_comments_xml(xml: &str) -> HashMap<String, RawComment> {
+    let mut reader = Reader::from_str(xml);
+    let mut comments: HashMap<String, RawComment> = HashMap::new();
+
+    let mut cur_id: Option<String> = None;
+    let mut cur_author = String::new();
+    let mut cur_date = String::new();
+    let mut cur_body = String::new();
+    let mut last_para_id: Option<String> = None;
+    let mut para_count: usize = 0;
+    let mut in_text = false;
+    // Depth of nested tables; w14:paraId is only meaningful on the comment's
+    // top-level paragraphs (commentsExtended threads on the last of those), so
+    // paraIds inside table cells must be ignored.
+    let mut table_depth: u32 = 0;
+
+    loop {
+        match reader.read_event() {
+            // Only Event::Start sets in_text: a self-closing `<w:t/>` arrives as
+            // Event::Empty with no matching End, so handling it here would leave
+            // in_text stuck true and leak later text into the body.
+            Ok(Event::Start(ref e)) => {
+                let local = e.local_name();
+                let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                match local_str {
+                    "comment" => {
+                        cur_id = None;
+                        cur_author = String::new();
+                        cur_date = String::new();
+                        cur_body = String::new();
+                        last_para_id = None;
+                        para_count = 0;
+                        table_depth = 0;
+                        if let Some(v) =
+                            crate::converter::ooxml_utils::attr_value_unescaped(e, "id")
+                        {
+                            cur_id = Some(v);
+                        }
+                        if let Some(v) =
+                            crate::converter::ooxml_utils::attr_value_unescaped(e, "author")
+                        {
+                            cur_author = v;
+                        }
+                        if let Some(v) =
+                            crate::converter::ooxml_utils::attr_value_unescaped(e, "date")
+                        {
+                            cur_date = v;
+                        }
+                    }
+                    "tbl" if cur_id.is_some() => table_depth += 1,
+                    "p" if cur_id.is_some() => {
+                        // Separate paragraphs with a newline (collapsed later).
+                        if para_count > 0 {
+                            cur_body.push('\n');
+                        }
+                        para_count += 1;
+                        // Capture w14:paraId of top-level paragraphs only (last wins).
+                        if table_depth == 0
+                            && let Some(v) =
+                                crate::converter::ooxml_utils::attr_value_unescaped(e, "paraId")
+                        {
+                            last_para_id = Some(v);
+                        }
+                    }
+                    "t" if cur_id.is_some() => in_text = true,
+                    _ => {}
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                let local = e.local_name();
+                let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                // A self-closing top-level `<w:p .../>` still counts paraId.
+                if local_str == "p"
+                    && cur_id.is_some()
+                    && table_depth == 0
+                    && let Some(v) =
+                        crate::converter::ooxml_utils::attr_value_unescaped(e, "paraId")
+                {
+                    last_para_id = Some(v);
+                }
+            }
+            Ok(Event::Text(ref e)) if in_text => {
+                cur_body.push_str(&e.unescape().unwrap_or_default());
+            }
+            Ok(Event::End(ref e)) => {
+                let local = e.local_name();
+                let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                match local_str {
+                    "t" => in_text = false,
+                    "tbl" if table_depth > 0 => table_depth -= 1,
+                    "comment" => {
+                        if let Some(id) = cur_id.take() {
+                            comments.insert(
+                                id,
+                                RawComment {
+                                    author: std::mem::take(&mut cur_author),
+                                    date: std::mem::take(&mut cur_date),
+                                    body: std::mem::take(&mut cur_body),
+                                    para_id: last_para_id.take(),
+                                },
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    comments
+}
+
+/// Parse `word/commentsExtended.xml`, returning the set of `w15:paraId` values
+/// that are replies (i.e., have a `w15:paraIdParent`).
+fn parse_comments_extended(xml: &str) -> HashSet<String> {
+    let mut reader = Reader::from_str(xml);
+    let mut reply_para_ids: HashSet<String> = HashSet::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let local = e.local_name();
+                let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                if local_str == "commentEx" {
+                    let mut para_id: Option<String> = None;
+                    let mut has_parent = false;
+                    for attr in e.attributes().flatten() {
+                        let k = attr.key.local_name();
+                        let k = std::str::from_utf8(k.as_ref()).unwrap_or("");
+                        match k {
+                            "paraId" => {
+                                para_id = Some(String::from_utf8_lossy(&attr.value).to_string());
+                            }
+                            "paraIdParent" => has_parent = true,
+                            _ => {}
+                        }
+                    }
+                    if has_parent && let Some(pid) = para_id {
+                        reply_para_ids.insert(pid);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    reply_para_ids
+}
+
+/// Collect commented-on text ranges from a single content part (document body,
+/// header, footer, footnotes, or endnotes).
+///
+/// Returns the comment ids in first-appearance order (keyed on whichever of
+/// `commentRangeStart` or `commentReference` appears first) and a map from id to
+/// the concatenated source text inside its range. Mirrors the body's extraction
+/// rules: skips `mc:Choice` branches, includes text-box/table text, and takes
+/// hyperlink display text (images contribute nothing).
+fn collect_ranges_in_part(xml: &str) -> (Vec<String>, HashMap<String, String>) {
+    let mut reader = Reader::from_str(xml);
+
+    let mut order: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut text: HashMap<String, String> = HashMap::new();
+    // Set of currently-open range ids; text events append to all of them.
+    let mut open: HashSet<String> = HashSet::new();
+
+    // Skip mc:Choice branches for CONTENT (mirror body behavior), but range
+    // markers are still honored inside them (see below).
+    let mut in_mc_choice = false;
+    let mut mc_choice_depth: u32 = 0;
+    // Text is only captured inside a run, matching the body parser — a loose
+    // `<w:t>` outside `<w:r>` is not rendered, so it must not appear in source.
+    let mut in_run = false;
+    let mut in_text = false;
+
+    // Per-range byte bound: a malformed range that is never closed (missing or
+    // misplaced commentRangeEnd) must not absorb the whole part. 4 bytes/char
+    // guarantees at least SOURCE_CAP chars survive for the later char-cap.
+    let cap_bytes = comments::SOURCE_CAP.saturating_mul(4);
+
+    // Append `s` to a range buffer, never exceeding `cap_bytes` total; the slice
+    // is cut on a char boundary so the buffer stays valid UTF-8.
+    let push_capped = |buf: &mut String, s: &str| {
+        if buf.len() >= cap_bytes {
+            return;
+        }
+        let mut room = cap_bytes - buf.len();
+        if room >= s.len() {
+            buf.push_str(s);
+        } else {
+            while room > 0 && !s.is_char_boundary(room) {
+                room -= 1;
+            }
+            buf.push_str(&s[..room]);
+        }
+    };
+
+    // Handle a comment range/reference marker. Returns true if `local_str` was a
+    // marker. Markers are honored even inside a skipped mc:Choice branch so that
+    // a range whose end lands there still closes (rather than leaking forever).
+    let handle_marker = |local_str: &str,
+                         e: &quick_xml::events::BytesStart,
+                         order: &mut Vec<String>,
+                         seen: &mut HashSet<String>,
+                         open: &mut HashSet<String>| {
+        // Record an id in first-appearance order.
+        let note_id = |order: &mut Vec<String>, seen: &mut HashSet<String>, id: String| {
+            if seen.insert(id.clone()) {
+                order.push(id);
+            }
+        };
+        match local_str {
+            "commentRangeStart" => {
+                if let Some(id) = range_id(e) {
+                    note_id(order, seen, id.clone());
+                    open.insert(id);
+                }
+                true
+            }
+            "commentRangeEnd" => {
+                if let Some(id) = range_id(e) {
+                    open.remove(&id);
+                }
+                true
+            }
+            "commentReference" => {
+                if let Some(id) = range_id(e) {
+                    note_id(order, seen, id);
+                }
+                true
+            }
+            _ => false,
+        }
+    };
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                let local = e.local_name();
+                let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                if handle_marker(local_str, e, &mut order, &mut seen, &mut open) {
+                    continue;
+                }
+                if in_mc_choice {
+                    mc_choice_depth += 1;
+                    continue;
+                }
+                match local_str {
+                    "Choice" => {
+                        in_mc_choice = true;
+                        mc_choice_depth = 1;
+                    }
+                    "r" => in_run = true,
+                    "t" => in_text = true,
+                    _ => {}
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                let local = e.local_name();
+                let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                if handle_marker(local_str, e, &mut order, &mut seen, &mut open) {
+                    continue;
+                }
+                if in_mc_choice {
+                    continue;
+                }
+                if local_str == "br" && in_run && !open.is_empty() {
+                    for id in &open {
+                        push_capped(text.entry(id.clone()).or_default(), " ");
+                    }
+                }
+            }
+            Ok(Event::Text(ref e)) if in_text && in_run && !open.is_empty() => {
+                let t = e.unescape().unwrap_or_default();
+                for id in &open {
+                    push_capped(text.entry(id.clone()).or_default(), &t);
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let local = e.local_name();
+                let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                if in_mc_choice {
+                    mc_choice_depth -= 1;
+                    if mc_choice_depth == 0 {
+                        in_mc_choice = false;
+                    }
+                    continue;
+                }
+                match local_str {
+                    "t" => in_text = false,
+                    "r" => {
+                        in_run = false;
+                        in_text = false;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    (order, text)
+}
+
+/// Extract the `w:id` attribute from a comment range/reference element.
+fn range_id(e: &quick_xml::events::BytesStart) -> Option<String> {
+    for attr in e.attributes().flatten() {
+        let k = attr.key.local_name();
+        let k = std::str::from_utf8(k.as_ref()).unwrap_or("");
+        if k == "id" {
+            return Some(String::from_utf8_lossy(&attr.value).to_string());
+        }
+    }
+    None
+}
+
+/// Assemble the final ordered list of [`Comment`]s for a DOCX document.
+///
+/// `part_orders` holds the per-part `(order, text)` results in the fixed scan
+/// sequence (body, headers, footers, footnotes, endnotes). Comments are ordered
+/// by first anchor appearance across parts (first part wins on duplicate ids);
+/// comments with no anchor anywhere are appended last in `comments.xml` order.
+/// A warning is pushed for any anchor referencing an unknown comment id.
+fn assemble_docx_comments(
+    raw: &HashMap<String, RawComment>,
+    reply_para_ids: &HashSet<String>,
+    part_results: &[(Vec<String>, HashMap<String, String>)],
+    warnings: &mut Vec<ConversionWarning>,
+) -> Vec<Comment> {
+    let mut anchored_order: Vec<String> = Vec::new();
+    let mut anchored_seen: HashSet<String> = HashSet::new();
+    let mut source_by_id: HashMap<String, String> = HashMap::new();
+
+    for (order, text) in part_results {
+        for id in order {
+            if anchored_seen.insert(id.clone()) {
+                anchored_order.push(id.clone());
+            }
+            // Merge discontinuous ranges for the same id across parts with " … ".
+            if let Some(t) = text.get(id)
+                && !t.is_empty()
+            {
+                match source_by_id.get_mut(id) {
+                    Some(existing) => {
+                        existing.push_str(" … ");
+                        existing.push_str(t);
+                    }
+                    None => {
+                        source_by_id.insert(id.clone(), t.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<Comment> = Vec::new();
+
+    // 1. Anchored comments, in appearance order.
+    for id in &anchored_order {
+        match raw.get(id) {
+            Some(rc) => result.push(build_comment(rc, reply_para_ids, source_by_id.get(id))),
+            None => warnings.push(ConversionWarning {
+                code: WarningCode::MalformedSegment,
+                message: format!("comment range references unknown comment id '{id}'"),
+                location: Some(id.clone()),
+            }),
+        }
+    }
+
+    // 2. Orphan comments (no anchor), in comments.xml id order (numeric when possible).
+    let mut orphan_ids: Vec<&String> = raw
+        .keys()
+        .filter(|id| !anchored_seen.contains(*id))
+        .collect();
+    // Sort by (numeric value, original string) so the comparator is a total
+    // order even with a mix of numeric and non-numeric ids: all parseable ids
+    // sort numerically and ahead of any non-numeric ones (None > Some), with the
+    // string as a stable tiebreaker.
+    orphan_ids.sort_by_key(|id| {
+        (
+            id.parse::<u64>().ok().is_none(),
+            id.parse::<u64>().ok(),
+            (*id).clone(),
+        )
+    });
+    for id in orphan_ids {
+        if let Some(rc) = raw.get(id) {
+            result.push(build_comment(rc, reply_para_ids, None));
+        }
+    }
+
+    result
+}
+
+/// Build a rendered [`Comment`] from a raw comment and optional source text.
+fn build_comment(
+    rc: &RawComment,
+    reply_para_ids: &HashSet<String>,
+    source: Option<&String>,
+) -> Comment {
+    let is_reply = rc
+        .para_id
+        .as_ref()
+        .is_some_and(|pid| reply_para_ids.contains(pid));
+    let source = source
+        .map(|s| comments::cap_text(&comments::collapse_ws(s), comments::SOURCE_CAP))
+        .unwrap_or_default();
+    Comment {
+        author: comments::format_author(&rc.author, &rc.date),
+        body: comments::collapse_ws(&rc.body),
+        source,
+        is_reply,
+    }
+}
+
+/// Read all DOCX comments for a document, scanning the body and any
+/// headers/footers/footnotes/endnotes for commented-on text ranges.
+///
+/// Returns an empty vec when there are no comments. `body_xml` is the already
+/// in-memory `word/document.xml`; other parts are read from `archive`.
+fn extract_docx_comments(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    body_xml: &str,
+    warnings: &mut Vec<ConversionWarning>,
+) -> Result<Vec<Comment>, ConvertError> {
+    // Comment parts are read leniently (lossy UTF-8): a malformed sub-part must
+    // not abort the whole document conversion (best-effort principle).
+    let comments_xml = match read_zip_text_lossy(archive, "word/comments.xml")? {
+        Some(xml) => xml,
+        None => return Ok(Vec::new()),
+    };
+    let raw = parse_comments_xml(&comments_xml);
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let reply_para_ids = match read_zip_text_lossy(archive, "word/commentsExtended.xml")? {
+        Some(xml) => parse_comments_extended(&xml),
+        None => HashSet::new(),
+    };
+
+    // Discover extra content parts in fixed-category order: headers, footers,
+    // then footnotes/endnotes. Within a category, sort by filename.
+    let names: Vec<String> = (0..archive.len())
+        .filter_map(|i| archive.by_index_raw(i).ok().map(|f| f.name().to_string()))
+        .collect();
+    let mut headers: Vec<String> = names
+        .iter()
+        .filter(|n| n.starts_with("word/header") && n.ends_with(".xml"))
+        .cloned()
+        .collect();
+    headers.sort();
+    let mut footers: Vec<String> = names
+        .iter()
+        .filter(|n| n.starts_with("word/footer") && n.ends_with(".xml"))
+        .cloned()
+        .collect();
+    footers.sort();
+
+    // Fixed scan order: body, headers, footers, footnotes, endnotes.
+    let mut part_results: Vec<(Vec<String>, HashMap<String, String>)> = Vec::new();
+    part_results.push(collect_ranges_in_part(body_xml));
+    for path in headers.iter().chain(footers.iter()) {
+        if let Some(xml) = read_zip_text_lossy(archive, path)? {
+            part_results.push(collect_ranges_in_part(&xml));
+        }
+    }
+    for path in ["word/footnotes.xml", "word/endnotes.xml"] {
+        if let Some(xml) = read_zip_text_lossy(archive, path)? {
+            part_results.push(collect_ranges_in_part(&xml));
+        }
+    }
+
+    Ok(assemble_docx_comments(
+        &raw,
+        &reply_para_ids,
+        &part_results,
+        warnings,
+    ))
+}
+
 // ---- Internal conversion (parse + image extraction, no resolution) ----
 
 impl DocxConverter {
     /// Parse the document and extract images without resolving placeholders.
     ///
-    /// Returns the conversion result (with unresolved placeholders in markdown)
-    /// and pending image data for later resolution (sync or async).
+    /// Returns the conversion result (with unresolved placeholders in markdown),
+    /// pending image data for later resolution (sync or async), and any extracted
+    /// comments (empty unless `options.extract_comments` is set). Comments are
+    /// appended to the output by the caller, after image placeholders resolve.
     pub(crate) fn convert_inner(
         &self,
         data: &[u8],
         options: &ConversionOptions,
-    ) -> Result<(ConversionResult, PendingImageResolution), ConvertError> {
+    ) -> Result<(ConversionResult, PendingImageResolution, Vec<Comment>), ConvertError> {
         let cursor = Cursor::new(data);
         let mut archive = ZipArchive::new(cursor)?;
 
@@ -1243,6 +1752,13 @@ impl DocxConverter {
             }
         }
 
+        // 6. Extract comments if requested (DOCX body + headers/footers/notes).
+        let doc_comments = if options.extract_comments {
+            extract_docx_comments(&mut archive, &document_xml, &mut warnings)?
+        } else {
+            Vec::new()
+        };
+
         let result = ConversionResult {
             markdown,
             plain_text,
@@ -1256,7 +1772,7 @@ impl DocxConverter {
             bytes: image_bytes_map,
         };
 
-        Ok((result, pending))
+        Ok((result, pending, doc_comments))
     }
 }
 
@@ -1272,7 +1788,7 @@ impl Converter for DocxConverter {
         data: &[u8],
         options: &ConversionOptions,
     ) -> Result<ConversionResult, ConvertError> {
-        let (mut result, pending) = self.convert_inner(data, options)?;
+        let (mut result, pending, doc_comments) = self.convert_inner(data, options)?;
         resolve_image_placeholders(
             &mut result.markdown,
             &mut result.plain_text,
@@ -1281,6 +1797,7 @@ impl Converter for DocxConverter {
             options.image_describer.as_deref(),
             &mut result.warnings,
         );
+        comments::append_comments(&mut result.markdown, &mut result.plain_text, &doc_comments);
         Ok(result)
     }
 }
@@ -3028,5 +3545,536 @@ mod tests {
             "expected empty output, got: {}",
             result.markdown
         );
+    }
+
+    // ---- Comment extraction tests ----
+
+    /// Build a DOCX with an arbitrary set of extra parts (e.g. comments.xml,
+    /// headers, footnotes) in addition to document.xml.
+    fn build_test_docx_with_parts(document_xml: &str, extra_parts: &[(&str, &str)]) -> Vec<u8> {
+        let byte_parts: Vec<(&str, Vec<u8>)> = extra_parts
+            .iter()
+            .map(|(p, c)| (*p, c.as_bytes().to_vec()))
+            .collect();
+        let refs: Vec<(&str, &[u8])> = byte_parts.iter().map(|(p, c)| (*p, c.as_slice())).collect();
+        build_test_docx_with_parts_bytes(document_xml, &refs)
+    }
+
+    /// Like `build_test_docx_with_parts`, but extra parts are raw bytes (so a
+    /// part can contain invalid UTF-8 for best-effort/lenient-decode tests).
+    fn build_test_docx_with_parts_bytes(
+        document_xml: &str,
+        extra_parts: &[(&str, &[u8])],
+    ) -> Vec<u8> {
+        use std::io::Write;
+        use zip::ZipWriter;
+        use zip::write::SimpleFileOptions;
+
+        let buf = Vec::new();
+        let mut zip = ZipWriter::new(Cursor::new(buf));
+        let opts = SimpleFileOptions::default();
+
+        let ct = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(ct.as_bytes()).unwrap();
+
+        zip.start_file("_rels/.rels", opts).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        )
+        .unwrap();
+
+        zip.start_file("word/document.xml", opts).unwrap();
+        zip.write_all(document_xml.as_bytes()).unwrap();
+
+        for (path, content) in extra_parts {
+            zip.start_file(*path, opts).unwrap();
+            zip.write_all(content).unwrap();
+        }
+
+        let cursor = zip.finish().unwrap();
+        cursor.into_inner()
+    }
+
+    /// Build a minimal `word/comments.xml` from (id, author, date, body) tuples.
+    /// Each comment's single paragraph carries a `w14:paraId` equal to `pid_<id>`.
+    fn comments_xml(entries: &[(&str, &str, &str, &str)]) -> String {
+        let mut s = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">"#,
+        );
+        for (id, author, date, body) in entries {
+            s.push_str(&format!(
+                r#"<w:comment w:id="{id}" w:author="{author}" w:date="{date}"><w:p w14:paraId="pid_{id}"><w:r><w:t xml:space="preserve">{body}</w:t></w:r></w:p></w:comment>"#
+            ));
+        }
+        s.push_str("</w:comments>");
+        s
+    }
+
+    // -- unit: parse_comments_xml --
+
+    #[test]
+    fn test_parse_comments_xml_basic() {
+        let xml = comments_xml(&[(
+            "1",
+            "Jane Smith",
+            "2024-01-15T09:30:00Z",
+            "Please revise this.",
+        )]);
+        let parsed = parse_comments_xml(&xml);
+        let c = parsed.get("1").expect("comment 1");
+        assert_eq!(c.author, "Jane Smith");
+        assert_eq!(c.date, "2024-01-15T09:30:00Z");
+        assert_eq!(c.body, "Please revise this.");
+        assert_eq!(c.para_id.as_deref(), Some("pid_1"));
+    }
+
+    #[test]
+    fn test_parse_comments_xml_no_author_empty() {
+        let xml = r#"<?xml version="1.0"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="3"><w:p><w:r><w:t>Body</w:t></w:r></w:p></w:comment></w:comments>"#;
+        let parsed = parse_comments_xml(xml);
+        let c = parsed.get("3").expect("comment 3");
+        assert_eq!(c.author, "");
+        assert_eq!(c.body, "Body");
+    }
+
+    #[test]
+    fn test_parse_comments_xml_multi_paragraph_joined() {
+        let xml = r#"<?xml version="1.0"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="1" w:author="A"><w:p><w:r><w:t>Line one</w:t></w:r></w:p><w:p><w:r><w:t>Line two</w:t></w:r></w:p></w:comment></w:comments>"#;
+        let parsed = parse_comments_xml(xml);
+        // Paragraphs separated by newline (collapsed downstream).
+        assert_eq!(parsed.get("1").unwrap().body, "Line one\nLine two");
+    }
+
+    // -- unit: parse_comments_extended --
+
+    #[test]
+    fn test_parse_comments_extended_replies() {
+        let xml = r#"<?xml version="1.0"?><w15:commentsEx xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"><w15:commentEx w15:paraId="pid_1" w15:done="0"/><w15:commentEx w15:paraId="pid_2" w15:paraIdParent="pid_1" w15:done="0"/></w15:commentsEx>"#;
+        let replies = parse_comments_extended(xml);
+        assert!(replies.contains("pid_2"));
+        assert!(!replies.contains("pid_1"));
+    }
+
+    // -- unit: collect_ranges_in_part --
+
+    #[test]
+    fn test_collect_ranges_basic_and_order() {
+        let body = wrap_body(
+            r#"<w:p><w:commentRangeStart w:id="2"/><w:r><w:t>second anchor</w:t></w:r><w:commentRangeEnd w:id="2"/><w:r><w:commentReference w:id="2"/></w:r></w:p><w:p><w:commentRangeStart w:id="1"/><w:r><w:t>first by id</w:t></w:r><w:commentRangeEnd w:id="1"/><w:r><w:commentReference w:id="1"/></w:r></w:p>"#,
+        );
+        let (order, text) = collect_ranges_in_part(&body);
+        // Order is by appearance: id 2 appears before id 1.
+        assert_eq!(order, vec!["2".to_string(), "1".to_string()]);
+        assert_eq!(text.get("2").map(|s| s.as_str()), Some("second anchor"));
+        assert_eq!(text.get("1").map(|s| s.as_str()), Some("first by id"));
+    }
+
+    #[test]
+    fn test_collect_ranges_zero_length_empty() {
+        let body = wrap_body(
+            r#"<w:p><w:commentRangeStart w:id="1"/><w:commentRangeEnd w:id="1"/><w:r><w:commentReference w:id="1"/></w:r></w:p>"#,
+        );
+        let (order, text) = collect_ranges_in_part(&body);
+        assert_eq!(order, vec!["1".to_string()]);
+        // Zero-length range -> no captured text.
+        assert!(text.get("1").map(|s| s.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn test_collect_ranges_skips_mc_choice() {
+        // The range spans an mc:AlternateContent; Choice text must be excluded.
+        let body = wrap_body(
+            r#"<w:p><w:commentRangeStart w:id="1"/><mc:AlternateContent><mc:Choice Requires="wps"><w:r><w:t>CHOICE</w:t></w:r></mc:Choice><mc:Fallback><w:r><w:t>FALLBACK</w:t></w:r></mc:Fallback></mc:AlternateContent><w:commentRangeEnd w:id="1"/><w:r><w:commentReference w:id="1"/></w:r></w:p>"#,
+        );
+        let (_order, text) = collect_ranges_in_part(&body);
+        let captured = text.get("1").cloned().unwrap_or_default();
+        assert!(captured.contains("FALLBACK"), "got: {captured}");
+        assert!(!captured.contains("CHOICE"), "got: {captured}");
+    }
+
+    // -- integration --
+
+    /// A document body with one commented range on id 1.
+    fn body_with_comment_1() -> String {
+        wrap_body(
+            r#"<w:p><w:r><w:t xml:space="preserve">Intro paragraph. </w:t></w:r><w:commentRangeStart w:id="1"/><w:r><w:t>the quick brown fox</w:t></w:r><w:commentRangeEnd w:id="1"/><w:r><w:commentReference w:id="1"/></w:r></w:p>"#,
+        )
+    }
+
+    #[test]
+    fn test_docx_comments_end_to_end() {
+        let doc = body_with_comment_1();
+        let cx = comments_xml(&[(
+            "1",
+            "Jane Smith",
+            "2024-01-15T09:30:00Z",
+            "Please revise this.",
+        )]);
+        let data = build_test_docx_with_parts(&doc, &[("word/comments.xml", &cx)]);
+        let options = ConversionOptions {
+            extract_comments: true,
+            ..Default::default()
+        };
+        let result = DocxConverter.convert(&data, &options).unwrap();
+        assert!(
+            result.markdown.contains("# Comments"),
+            "md: {}",
+            result.markdown
+        );
+        assert!(result.markdown.contains("## 1"));
+        assert!(
+            result
+                .markdown
+                .contains("- **author**: Jane Smith (2024-01-15T09:30:00Z)")
+        );
+        assert!(
+            result
+                .markdown
+                .contains("- **comment**: Please revise this.")
+        );
+        assert!(
+            result
+                .markdown
+                .contains("- **source**: the quick brown fox")
+        );
+        // Body content is preserved above the section.
+        assert!(result.markdown.contains("Intro paragraph."));
+        let body_pos = result.markdown.find("Intro paragraph.").unwrap();
+        let cmt_pos = result.markdown.find("# Comments").unwrap();
+        assert!(body_pos < cmt_pos, "comments must be appended at the end");
+    }
+
+    #[test]
+    fn test_docx_comments_absent_when_flag_off() {
+        let doc = body_with_comment_1();
+        let cx = comments_xml(&[("1", "Jane", "2024-01-15T09:30:00Z", "Hi")]);
+        let data = build_test_docx_with_parts(&doc, &[("word/comments.xml", &cx)]);
+        // Default options: extract_comments = false.
+        let result = DocxConverter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        assert!(!result.markdown.contains("# Comments"));
+        assert!(!result.plain_text.contains("Comments"));
+    }
+
+    #[test]
+    fn test_docx_comments_plain_text_stripped() {
+        let doc = body_with_comment_1();
+        let cx = comments_xml(&[("1", "Jane Smith", "2024-01-15T09:30:00Z", "Revise.")]);
+        let data = build_test_docx_with_parts(&doc, &[("word/comments.xml", &cx)]);
+        let options = ConversionOptions {
+            extract_comments: true,
+            ..Default::default()
+        };
+        let result = DocxConverter.convert(&data, &options).unwrap();
+        assert!(result.plain_text.contains("Comments\n"));
+        assert!(
+            result
+                .plain_text
+                .contains("author: Jane Smith (2024-01-15T09:30:00Z)")
+        );
+        assert!(result.plain_text.contains("comment: Revise."));
+        assert!(result.plain_text.contains("source: the quick brown fox"));
+        // No markdown markers in the appended plain-text section.
+        assert!(!result.plain_text.contains("**"));
+        assert!(!result.plain_text.contains("# Comments"));
+    }
+
+    #[test]
+    fn test_docx_comments_unknown_author() {
+        let doc = body_with_comment_1();
+        // No author attribute on the comment.
+        let cx = r#"<?xml version="1.0"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="1"><w:p><w:r><w:t>Anonymous note</w:t></w:r></w:p></w:comment></w:comments>"#;
+        let data = build_test_docx_with_parts(&doc, &[("word/comments.xml", cx)]);
+        let options = ConversionOptions {
+            extract_comments: true,
+            ..Default::default()
+        };
+        let result = DocxConverter.convert(&data, &options).unwrap();
+        assert!(
+            result.markdown.contains("- **author**: Unknown"),
+            "md: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_docx_comments_reply_marked() {
+        let doc = wrap_body(
+            r#"<w:p><w:commentRangeStart w:id="1"/><w:r><w:t>anchor text</w:t></w:r><w:commentRangeEnd w:id="1"/><w:r><w:commentReference w:id="1"/></w:r><w:commentRangeStart w:id="2"/><w:r><w:t>more</w:t></w:r><w:commentRangeEnd w:id="2"/><w:r><w:commentReference w:id="2"/></w:r></w:p>"#,
+        );
+        let cx = comments_xml(&[
+            ("1", "Alice", "2024-01-01T00:00:00Z", "Top level"),
+            ("2", "Bob", "2024-01-02T00:00:00Z", "Agreed"),
+        ]);
+        // comment 2 (paraId pid_2) is a reply to comment 1 (pid_1).
+        let cex = r#"<?xml version="1.0"?><w15:commentsEx xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"><w15:commentEx w15:paraId="pid_1"/><w15:commentEx w15:paraId="pid_2" w15:paraIdParent="pid_1"/></w15:commentsEx>"#;
+        let data = build_test_docx_with_parts(
+            &doc,
+            &[
+                ("word/comments.xml", &cx),
+                ("word/commentsExtended.xml", cex),
+            ],
+        );
+        let options = ConversionOptions {
+            extract_comments: true,
+            ..Default::default()
+        };
+        let result = DocxConverter.convert(&data, &options).unwrap();
+        assert!(result.markdown.contains("- **comment**: Top level"));
+        assert!(
+            result.markdown.contains("- **comment**: (reply) Agreed"),
+            "reply not marked, md: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_docx_comments_source_capped_at_200() {
+        let long = "x".repeat(300);
+        let doc = wrap_body(&format!(
+            r#"<w:p><w:commentRangeStart w:id="1"/><w:r><w:t>{long}</w:t></w:r><w:commentRangeEnd w:id="1"/><w:r><w:commentReference w:id="1"/></w:r></w:p>"#
+        ));
+        let cx = comments_xml(&[("1", "A", "2024-01-01T00:00:00Z", "note")]);
+        let data = build_test_docx_with_parts(&doc, &[("word/comments.xml", &cx)]);
+        let options = ConversionOptions {
+            extract_comments: true,
+            ..Default::default()
+        };
+        let result = DocxConverter.convert(&data, &options).unwrap();
+        // The source line is capped to 200 x's + ellipsis (the full 300-char run
+        // still appears in the body paragraph, so we check the source line only).
+        let expected = format!("- **source**: {}…", "x".repeat(200));
+        assert!(
+            result.markdown.contains(&expected),
+            "md: {}",
+            result.markdown
+        );
+        let source_line = result
+            .markdown
+            .lines()
+            .find(|l| l.starts_with("- **source**:"))
+            .expect("source line");
+        // 200 x's capped: line is "- **source**: " + 200 x + "…".
+        assert_eq!(source_line.matches('x').count(), 200, "line: {source_line}");
+    }
+
+    #[test]
+    fn test_docx_comments_orphan_listed_last() {
+        // Comment 1 is anchored; comment 9 has no range anywhere (orphan).
+        let doc = body_with_comment_1();
+        let cx = comments_xml(&[
+            ("1", "Anchored", "2024-01-01T00:00:00Z", "Has anchor"),
+            ("9", "Orphan", "2024-01-02T00:00:00Z", "No anchor"),
+        ]);
+        let data = build_test_docx_with_parts(&doc, &[("word/comments.xml", &cx)]);
+        let options = ConversionOptions {
+            extract_comments: true,
+            ..Default::default()
+        };
+        let result = DocxConverter.convert(&data, &options).unwrap();
+        let anchored = result.markdown.find("Has anchor").unwrap();
+        let orphan = result.markdown.find("No anchor").unwrap();
+        assert!(
+            anchored < orphan,
+            "orphan must come last, md: {}",
+            result.markdown
+        );
+        // Orphan's source is empty.
+        assert!(
+            result
+                .markdown
+                .contains("- **comment**: No anchor\n- **source**: \n")
+        );
+    }
+
+    #[test]
+    fn test_docx_comments_header_anchor_after_body() {
+        // Comment 1 anchored in body, comment 2 anchored only in a header.
+        let doc = wrap_body(
+            r#"<w:p><w:commentRangeStart w:id="1"/><w:r><w:t>body anchor</w:t></w:r><w:commentRangeEnd w:id="1"/><w:r><w:commentReference w:id="1"/></w:r></w:p>"#,
+        );
+        let header = wrap_body(
+            r#"<w:p><w:commentRangeStart w:id="2"/><w:r><w:t>header anchor</w:t></w:r><w:commentRangeEnd w:id="2"/><w:r><w:commentReference w:id="2"/></w:r></w:p>"#,
+        );
+        let cx = comments_xml(&[
+            ("1", "BodyAuthor", "2024-01-01T00:00:00Z", "Body comment"),
+            (
+                "2",
+                "HeaderAuthor",
+                "2024-01-02T00:00:00Z",
+                "Header comment",
+            ),
+        ]);
+        let data = build_test_docx_with_parts(
+            &doc,
+            &[("word/comments.xml", &cx), ("word/header1.xml", &header)],
+        );
+        let options = ConversionOptions {
+            extract_comments: true,
+            ..Default::default()
+        };
+        let result = DocxConverter.convert(&data, &options).unwrap();
+        let body_c = result.markdown.find("Body comment").unwrap();
+        let header_c = result.markdown.find("Header comment").unwrap();
+        assert!(
+            body_c < header_c,
+            "body comment must precede header comment"
+        );
+        assert!(result.markdown.contains("- **source**: header anchor"));
+    }
+
+    #[test]
+    fn test_docx_comments_unknown_range_id_warns() {
+        // Body references comment id 5, but comments.xml only has id 1.
+        let doc = wrap_body(
+            r#"<w:p><w:commentRangeStart w:id="5"/><w:r><w:t>x</w:t></w:r><w:commentRangeEnd w:id="5"/><w:r><w:commentReference w:id="5"/></w:r></w:p>"#,
+        );
+        let cx = comments_xml(&[("1", "A", "2024-01-01T00:00:00Z", "real")]);
+        let data = build_test_docx_with_parts(&doc, &[("word/comments.xml", &cx)]);
+        let options = ConversionOptions {
+            extract_comments: true,
+            ..Default::default()
+        };
+        let result = DocxConverter.convert(&data, &options).unwrap();
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::MalformedSegment
+                    && w.message.contains("unknown comment id")),
+            "expected malformed-segment warning, warnings: {:?}",
+            result.warnings
+        );
+        // Comment 1 is an orphan but still emitted.
+        assert!(result.markdown.contains("- **comment**: real"));
+    }
+
+    #[test]
+    fn test_docx_comments_none_present_no_section() {
+        // extract_comments on, but the document has no comments.xml.
+        let doc = wrap_body(&para("Just text."));
+        let data = build_test_docx_with_parts(&doc, &[]);
+        let options = ConversionOptions {
+            extract_comments: true,
+            ..Default::default()
+        };
+        let result = DocxConverter.convert(&data, &options).unwrap();
+        assert!(!result.markdown.contains("# Comments"));
+    }
+
+    // ---- Regression tests for review findings ----
+
+    fn extract_opts() -> ConversionOptions {
+        ConversionOptions {
+            extract_comments: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_parse_comments_xml_self_closing_t_no_leak() {
+        // Finding 5: a self-closing <w:t/> (Empty event) must not leave in_text
+        // stuck true and capture stray text from later in the same comment.
+        let cx = r#"<?xml version="1.0"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="1" w:author="A"><w:p><w:r><w:t/></w:r><w:r><w:t>real</w:t></w:r></w:p></w:comment></w:comments>"#;
+        let parsed = parse_comments_xml(cx);
+        assert_eq!(parsed.get("1").unwrap().body, "real");
+    }
+
+    #[test]
+    fn test_parse_comments_xml_unescapes_author() {
+        // Finding 8: author/date attributes must be XML-unescaped.
+        let cx = r#"<?xml version="1.0"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="1" w:author="R&amp;D &lt;Team&gt;"><w:p><w:r><w:t>x</w:t></w:r></w:p></w:comment></w:comments>"#;
+        let parsed = parse_comments_xml(cx);
+        assert_eq!(parsed.get("1").unwrap().author, "R&D <Team>");
+    }
+
+    #[test]
+    fn test_parse_comments_xml_para_id_ignores_table_cells() {
+        // Finding 9: w14:paraId must come from the last TOP-LEVEL paragraph, not
+        // a nested table-cell paragraph.
+        let cx = r#"<?xml version="1.0"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w:comment w:id="1" w:author="A"><w:p w14:paraId="TOP">text</w:p><w:tbl><w:tr><w:tc><w:p w14:paraId="CELL"><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:comment></w:comments>"#;
+        let parsed = parse_comments_xml(cx);
+        assert_eq!(parsed.get("1").unwrap().para_id.as_deref(), Some("TOP"));
+    }
+
+    #[test]
+    fn test_collect_ranges_end_inside_mc_choice_closes() {
+        // Findings 1/3: a commentRangeEnd buried in a skipped mc:Choice must still
+        // close the range, so later text does not leak into the source.
+        let body = wrap_body(
+            r#"<w:p><w:commentRangeStart w:id="1"/><w:r><w:t>anchor</w:t></w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:commentRangeEnd w:id="1"/></mc:Choice><mc:Fallback><w:r><w:t>fb</w:t></w:r></mc:Fallback></mc:AlternateContent><w:r><w:commentReference w:id="1"/></w:r></w:p><w:p><w:r><w:t>UNRELATED LATER TEXT</w:t></w:r></w:p>"#,
+        );
+        let (_order, text) = collect_ranges_in_part(&body);
+        let src = text.get("1").cloned().unwrap_or_default();
+        assert!(src.contains("anchor"), "src: {src}");
+        assert!(
+            !src.contains("UNRELATED"),
+            "range leaked past its end: {src}"
+        );
+    }
+
+    #[test]
+    fn test_collect_ranges_unclosed_range_is_bounded() {
+        // Finding 1: a range with no commentRangeEnd at all must not absorb an
+        // unbounded amount of the part (bounded to SOURCE_CAP*4 bytes).
+        let huge = "x".repeat(5000);
+        let body = wrap_body(&format!(
+            r#"<w:p><w:commentRangeStart w:id="1"/><w:r><w:t>anchor</w:t></w:r><w:r><w:commentReference w:id="1"/></w:r></w:p><w:p><w:r><w:t>{huge}</w:t></w:r></w:p>"#
+        ));
+        let (_order, text) = collect_ranges_in_part(&body);
+        let src = text.get("1").cloned().unwrap_or_default();
+        // Bounded well under the 5000-char tail (cap is SOURCE_CAP*4 = 800 bytes).
+        assert!(
+            src.len() <= comments::SOURCE_CAP * 4 + 16,
+            "unbounded: {} bytes",
+            src.len()
+        );
+    }
+
+    #[test]
+    fn test_collect_ranges_ignores_loose_text_outside_run() {
+        // Finding 6: text outside a <w:r> is not rendered in the body, so it must
+        // not appear in the commented-on source either.
+        let body = wrap_body(
+            r#"<w:p><w:commentRangeStart w:id="1"/><w:t>loose no run</w:t><w:r><w:t>real</w:t></w:r><w:commentRangeEnd w:id="1"/><w:r><w:commentReference w:id="1"/></w:r></w:p>"#,
+        );
+        let (_order, text) = collect_ranges_in_part(&body);
+        let src = text.get("1").cloned().unwrap_or_default();
+        assert_eq!(
+            src, "real",
+            "loose text outside a run leaked into source: {src}"
+        );
+    }
+
+    #[test]
+    fn test_docx_comments_author_entity_end_to_end() {
+        // Finding 8 end-to-end: "R&D" renders as R&D, not R&amp;D.
+        let doc = body_with_comment_1();
+        let cx = comments_xml(&[("1", "R&amp;D Team", "2024-01-01T00:00:00Z", "note")]);
+        let data = build_test_docx_with_parts(&doc, &[("word/comments.xml", &cx)]);
+        let result = DocxConverter.convert(&data, &extract_opts()).unwrap();
+        assert!(
+            result.markdown.contains("- **author**: R&D Team"),
+            "md: {}",
+            result.markdown
+        );
+        assert!(!result.markdown.contains("R&amp;D"));
+    }
+
+    #[test]
+    fn test_docx_comments_malformed_part_does_not_abort() {
+        // Finding 4: a non-UTF-8 comments.xml must not abort conversion; the body
+        // still converts (best-effort).
+        let doc = wrap_body(&para("Body survives."));
+        // comments.xml referencing valid structure but with an invalid byte.
+        let mut cx = comments_xml(&[("1", "A", "2024-01-01T00:00:00Z", "ok")]).into_bytes();
+        cx.push(0xFF); // invalid UTF-8 trailing byte
+        let data = build_test_docx_with_parts_bytes(&doc, &[("word/comments.xml", &cx)]);
+        let result = DocxConverter.convert(&data, &extract_opts()).unwrap();
+        assert!(result.markdown.contains("Body survives."));
+        // Lossy decode still recovers the well-formed comment.
+        assert!(result.markdown.contains("# Comments"));
     }
 }

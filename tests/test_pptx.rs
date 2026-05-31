@@ -291,3 +291,71 @@ fn test_pptx_group_shape_convert_file() {
     // Title from first slide
     assert_eq!(result.title, Some("Group Shape Demo".to_string()),);
 }
+
+/// End-to-end PPTX comment extraction through the public `convert_bytes` API.
+///
+/// Builds a one-slide presentation with a legacy comment part and verifies the
+/// appended `# Comments` section uses the slide label as `source`.
+#[test]
+fn test_pptx_extract_comments_end_to_end() {
+    use std::io::Write;
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let buf = Vec::new();
+    let mut zip = ZipWriter::new(Cursor::new(buf));
+    let opts = SimpleFileOptions::default();
+
+    zip.start_file("[Content_Types].xml", opts).unwrap();
+    zip.write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>"#).unwrap();
+
+    zip.start_file("ppt/presentation.xml", opts).unwrap();
+    zip.write_all(br#"<?xml version="1.0"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#).unwrap();
+    zip.start_file("ppt/_rels/presentation.xml.rels", opts)
+        .unwrap();
+    zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#).unwrap();
+
+    zip.start_file("ppt/slides/slide1.xml", opts).unwrap();
+    zip.write_all(br#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="1" name="Title"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Roadmap</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#).unwrap();
+
+    zip.start_file("ppt/slides/_rels/slide1.xml.rels", opts)
+        .unwrap();
+    zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdC" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments/comment1.xml"/></Relationships>"#).unwrap();
+
+    zip.start_file("ppt/commentAuthors.xml", opts).unwrap();
+    zip.write_all(br#"<?xml version="1.0"?><p:cmAuthorLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cmAuthor id="0" name="Dana" initials="D"/></p:cmAuthorLst>"#).unwrap();
+    zip.start_file("ppt/comments/comment1.xml", opts).unwrap();
+    zip.write_all(br#"<?xml version="1.0"?><p:cmLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cm authorId="0" dt="2024-02-02T08:00:00Z" idx="1"><p:pos x="100" y="100"/><p:text>Reorder these milestones.</p:text></p:cm></p:cmLst>"#).unwrap();
+
+    let data = zip.finish().unwrap().into_inner();
+
+    // Without the flag: no Comments section.
+    let plain = anytomd::convert_bytes(&data, "pptx", &ConversionOptions::default()).unwrap();
+    assert!(!plain.markdown.contains("# Comments"));
+
+    let options = ConversionOptions {
+        extract_comments: true,
+        ..Default::default()
+    };
+    let result = anytomd::convert_bytes(&data, "pptx", &options).unwrap();
+    assert!(
+        result.markdown.contains("# Comments"),
+        "md: {}",
+        result.markdown
+    );
+    assert!(
+        result
+            .markdown
+            .contains("- **author**: Dana (2024-02-02T08:00:00Z)")
+    );
+    assert!(
+        result
+            .markdown
+            .contains("- **comment**: Reorder these milestones.")
+    );
+    assert!(result.markdown.contains("- **source**: Slide 1: Roadmap"));
+    // Slide content precedes the appended section.
+    let slide = result.markdown.find("## Slide 1").unwrap();
+    let section = result.markdown.find("# Comments").unwrap();
+    assert!(slide < section);
+}

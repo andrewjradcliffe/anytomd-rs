@@ -306,3 +306,37 @@ fn test_cli_plain_text_with_size_limits() {
         .success()
         .stdout(predicate::str::contains("Alice"));
 }
+
+/// --extract-comments is listed in --help.
+#[test]
+fn test_cli_extract_comments_in_help() {
+    cmd()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--extract-comments"));
+}
+
+/// --extract-comments is a harmless no-op for formats without comments (CSV).
+#[test]
+fn test_cli_extract_comments_noop_on_csv() {
+    cmd()
+        .args(["--extract-comments", "tests/fixtures/sample.csv"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("# Comments").not());
+}
+
+/// --extract-comments extracts the Comments section from the sample DOCX
+/// (only if that fixture actually contains comments — otherwise no section).
+#[test]
+fn test_cli_extract_comments_docx_runs() {
+    // The flag must not break DOCX conversion regardless of whether the fixture
+    // has comments; the body content must still be present.
+    cmd()
+        .args(["--extract-comments", "tests/fixtures/sample.docx"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Sample Document"));
+}

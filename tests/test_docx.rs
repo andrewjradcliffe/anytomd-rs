@@ -267,3 +267,94 @@ fn test_docx_textbox_convert_file() {
     // Title
     assert_eq!(result.title, Some("Text Box Test Document".to_string()),);
 }
+
+/// End-to-end comment extraction through the public `convert_bytes` API.
+///
+/// Builds a DOCX in memory with a commented range and a `word/comments.xml`,
+/// then verifies the appended `# Comments` section in both markdown and plain
+/// text, and that it is absent without the flag.
+#[test]
+fn test_docx_extract_comments_end_to_end() {
+    use std::io::Write;
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let buf = Vec::new();
+    let mut zip = ZipWriter::new(Cursor::new(buf));
+    let opts = SimpleFileOptions::default();
+
+    zip.start_file("[Content_Types].xml", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+    )
+    .unwrap();
+
+    zip.start_file("_rels/.rels", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+    )
+    .unwrap();
+
+    // Body: a sentence with a commented range (id 1).
+    let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">The report is due </w:t></w:r><w:commentRangeStart w:id="1"/><w:r><w:t>next Friday</w:t></w:r><w:commentRangeEnd w:id="1"/><w:r><w:commentReference w:id="1"/></w:r><w:r><w:t>.</w:t></w:r></w:p></w:body></w:document>"#;
+    zip.start_file("word/document.xml", opts).unwrap();
+    zip.write_all(document_xml.as_bytes()).unwrap();
+
+    let comments_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="1" w:author="Reviewer" w:date="2024-03-01T12:00:00Z"><w:p><w:r><w:t>Can we move this up a week?</w:t></w:r></w:p></w:comment></w:comments>"#;
+    zip.start_file("word/comments.xml", opts).unwrap();
+    zip.write_all(comments_xml.as_bytes()).unwrap();
+
+    let data = zip.finish().unwrap().into_inner();
+
+    // Without the flag: no Comments section.
+    let plain_result =
+        anytomd::convert_bytes(&data, "docx", &ConversionOptions::default()).unwrap();
+    assert!(!plain_result.markdown.contains("# Comments"));
+    assert!(
+        plain_result
+            .markdown
+            .contains("The report is due next Friday.")
+    );
+
+    // With the flag: appended section in markdown and plain text.
+    let options = ConversionOptions {
+        extract_comments: true,
+        ..Default::default()
+    };
+    let result = anytomd::convert_bytes(&data, "docx", &options).unwrap();
+    assert!(
+        result.markdown.contains("# Comments"),
+        "md: {}",
+        result.markdown
+    );
+    assert!(result.markdown.contains("## 1"));
+    assert!(
+        result
+            .markdown
+            .contains("- **author**: Reviewer (2024-03-01T12:00:00Z)")
+    );
+    assert!(
+        result
+            .markdown
+            .contains("- **comment**: Can we move this up a week?")
+    );
+    assert!(result.markdown.contains("- **source**: next Friday"));
+    // Body still present and the section is appended at the end.
+    let body = result.markdown.find("The report is due").unwrap();
+    let section = result.markdown.find("# Comments").unwrap();
+    assert!(body < section);
+    // Plain text mirrors the layout with markers stripped.
+    assert!(result.plain_text.contains("Comments\n"));
+    assert!(
+        result
+            .plain_text
+            .contains("author: Reviewer (2024-03-01T12:00:00Z)")
+    );
+    assert!(
+        result
+            .plain_text
+            .contains("comment: Can we move this up a week?")
+    );
+    assert!(result.plain_text.contains("source: next Friday"));
+    assert!(!result.plain_text.contains("# Comments"));
+}

@@ -12,16 +12,17 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use zip::ZipArchive;
 
+use crate::converter::comments::{self, Comment};
 use crate::converter::ooxml_utils::{
-    ImageInfo, PendingImageResolution, Relationship, derive_rels_path, parse_relationships,
-    resolve_image_placeholders, resolve_relative_to_file,
+    ImageInfo, PendingImageResolution, Relationship, attr_value_unescaped, derive_rels_path,
+    parse_relationships, resolve_image_placeholders, resolve_relative_to_file,
 };
 use crate::converter::{
     ConversionOptions, ConversionResult, ConversionWarning, Converter, WarningCode,
 };
 use crate::error::ConvertError;
 use crate::markdown::{build_table, build_table_plain};
-use crate::zip_utils::{read_zip_bytes, read_zip_text};
+use crate::zip_utils::{read_zip_bytes, read_zip_text, read_zip_text_lossy};
 
 /// Converts PPTX files to Markdown.
 pub struct PptxConverter;
@@ -828,18 +829,279 @@ fn render_slide(
 
 // ---- Converter trait impl ----
 
+// ---- Comment extraction ----
+
+/// Parse an author registry, mapping each author `id` to its `name`.
+///
+/// `elem` is the author element's local name — `cmAuthor` for the legacy
+/// `ppt/commentAuthors.xml` (`<p:cmAuthor id="0" name="Julie Lee"/>`) or
+/// `author` for the modern `ppt/authors.xml` (`<p188:author id="{GUID}"
+/// name="Julie Lee"/>`). Names are XML-unescaped.
+fn parse_author_registry(xml: &str, elem: &str) -> HashMap<String, String> {
+    let mut reader = Reader::from_str(xml);
+    let mut authors = HashMap::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let local = e.local_name();
+                if std::str::from_utf8(local.as_ref()).unwrap_or("") == elem
+                    && let Some(id) = attr_value_unescaped(e, "id")
+                {
+                    let name = attr_value_unescaped(e, "name").unwrap_or_default();
+                    authors.insert(id, name);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    authors
+}
+
+/// A raw PPTX comment before it is turned into a rendered [`Comment`].
+#[derive(Debug, Clone)]
+struct RawPptxComment {
+    author: String,
+    date: String,
+    body: String,
+    is_reply: bool,
+}
+
+/// Parse a legacy comment file (`ppt/comments/commentN.xml`).
+///
+/// Comments are `<p:cm authorId="0" dt="..." idx="1">` with the body as plain
+/// text in a `<p:text>` child. Legacy comments are never replies.
+fn parse_legacy_comments(xml: &str, authors: &HashMap<String, String>) -> Vec<RawPptxComment> {
+    let mut reader = Reader::from_str(xml);
+    let mut out = Vec::new();
+
+    let mut author = String::new();
+    let mut date = String::new();
+    let mut body = String::new();
+    let mut in_cm = false;
+    let mut in_text = false;
+
+    loop {
+        match reader.read_event() {
+            // Only Event::Start sets in_text: a self-closing `<p:text/>` (Empty,
+            // no End) would otherwise leave in_text stuck true and leak later
+            // text into the body.
+            Ok(Event::Start(ref e)) => {
+                let local = e.local_name();
+                let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                match local_str {
+                    "cm" => {
+                        in_cm = true;
+                        author = String::new();
+                        date = String::new();
+                        body = String::new();
+                        if let Some(v) = attr_value_unescaped(e, "authorId") {
+                            author = authors.get(&v).cloned().unwrap_or_default();
+                        }
+                        if let Some(v) = attr_value_unescaped(e, "dt") {
+                            date = v;
+                        }
+                    }
+                    "text" if in_cm => in_text = true,
+                    _ => {}
+                }
+            }
+            // A self-closing `<p:cm .../>` (no children) still yields a comment.
+            Ok(Event::Empty(ref e)) => {
+                let local = e.local_name();
+                if std::str::from_utf8(local.as_ref()).unwrap_or("") == "cm" {
+                    let author = attr_value_unescaped(e, "authorId")
+                        .and_then(|v| authors.get(&v).cloned())
+                        .unwrap_or_default();
+                    let date = attr_value_unescaped(e, "dt").unwrap_or_default();
+                    out.push(RawPptxComment {
+                        author,
+                        date,
+                        body: String::new(),
+                        is_reply: false,
+                    });
+                }
+            }
+            Ok(Event::Text(ref e)) if in_text => {
+                body.push_str(&e.unescape().unwrap_or_default());
+            }
+            Ok(Event::End(ref e)) => {
+                let local = e.local_name();
+                let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                match local_str {
+                    "text" => in_text = false,
+                    "cm" if in_cm => {
+                        out.push(RawPptxComment {
+                            author: std::mem::take(&mut author),
+                            date: std::mem::take(&mut date),
+                            body: std::mem::take(&mut body),
+                            is_reply: false,
+                        });
+                        in_cm = false;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    out
+}
+
+/// Parse a modern comment file (`ppt/comments/modernComment_*.xml`).
+///
+/// Comments are `<p188:cm authorId="{GUID}" created="...">` whose body lives in
+/// DrawingML `<a:t>` runs inside `<p188:txBody>`. Replies are nested inside a
+/// `<p188:replyLst>` and are marked `is_reply = true`. Top-level comments and
+/// replies are emitted in document order (a parent precedes its replies).
+fn parse_modern_comments(xml: &str, authors: &HashMap<String, String>) -> Vec<RawPptxComment> {
+    let mut reader = Reader::from_str(xml);
+    let mut out = Vec::new();
+
+    /// One in-progress comment on the parse stack.
+    struct Frame {
+        /// Document start order, so a parent (whose start tag precedes its
+        /// reply's) is emitted before its replies even though it closes later.
+        seq: usize,
+        author: String,
+        date: String,
+        body: String,
+        is_reply: bool,
+    }
+
+    // Comments nest: a `cm`'s `replyLst` (and its `reply` children) appears
+    // before the `cm`'s own `txBody`. A stack keeps each comment's captured
+    // attributes and body separate; text appends to the innermost open frame.
+    // Finished frames are collected with their start `seq`, then sorted so the
+    // emit order is document order (parent before reply).
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut finished: Vec<Frame> = Vec::new();
+    let mut next_seq: usize = 0;
+    let mut in_text = false;
+
+    // Build a Frame from a cm/reply element's attributes.
+    let make_frame = |e: &quick_xml::events::BytesStart, is_reply: bool, seq: usize| {
+        let author = attr_value_unescaped(e, "authorId")
+            .and_then(|v| authors.get(&v).cloned())
+            .unwrap_or_default();
+        let date = attr_value_unescaped(e, "created").unwrap_or_default();
+        Frame {
+            seq,
+            author,
+            date,
+            body: String::new(),
+            is_reply,
+        }
+    };
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                let local = e.local_name();
+                let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                match local_str {
+                    "cm" | "reply" => {
+                        stack.push(make_frame(e, local_str == "reply", next_seq));
+                        next_seq += 1;
+                    }
+                    // Only Event::Start sets in_text: a self-closing `<a:t/>`
+                    // (Empty, no End) would otherwise leak later text into the
+                    // innermost open frame's body.
+                    "t" if !stack.is_empty() => in_text = true,
+                    _ => {}
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                // A self-closing `<p188:cm/>`/`<p188:reply/>` (no body) is a
+                // complete empty comment.
+                let local = e.local_name();
+                let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                if local_str == "cm" || local_str == "reply" {
+                    finished.push(make_frame(e, local_str == "reply", next_seq));
+                    next_seq += 1;
+                }
+            }
+            Ok(Event::Text(ref e)) if in_text => {
+                if let Some(frame) = stack.last_mut() {
+                    frame.body.push_str(&e.unescape().unwrap_or_default());
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let local = e.local_name();
+                let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                match local_str {
+                    "t" => in_text = false,
+                    "cm" | "reply" => {
+                        if let Some(frame) = stack.pop() {
+                            finished.push(frame);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    finished.sort_by_key(|f| f.seq);
+    for frame in finished {
+        out.push(RawPptxComment {
+            author: frame.author,
+            date: frame.date,
+            body: frame.body,
+            is_reply: frame.is_reply,
+        });
+    }
+
+    out
+}
+
+/// Build the slide-label `source` for a PPTX comment: `Slide N: Title` when the
+/// slide has a title, else `Slide N`.
+///
+/// The title's internal whitespace is collapsed (a multi-paragraph or
+/// `<a:br/>`-bearing title contains newlines) and the label is capped, so the
+/// rendered `- **source**:` line never breaks across multiple lines.
+fn slide_label(number: usize, title: Option<&str>) -> String {
+    let label = match title.map(comments::collapse_ws) {
+        Some(t) if !t.is_empty() => format!("Slide {number}: {t}"),
+        _ => format!("Slide {number}"),
+    };
+    comments::cap_text(&label, comments::SOURCE_CAP)
+}
+
+/// Convert raw PPTX comments for one slide into rendered [`Comment`]s.
+fn build_pptx_comments(raw: Vec<RawPptxComment>, source: &str) -> Vec<Comment> {
+    raw.into_iter()
+        .map(|rc| Comment {
+            author: comments::format_author(&rc.author, &rc.date),
+            body: comments::collapse_ws(&rc.body),
+            source: source.to_string(),
+            is_reply: rc.is_reply,
+        })
+        .collect()
+}
+
 // ---- Internal conversion (parse + image extraction, no resolution) ----
 
 impl PptxConverter {
     /// Parse the presentation and extract images without resolving placeholders.
     ///
-    /// Returns the conversion result (with unresolved placeholders in markdown)
-    /// and pending image data for later resolution (sync or async).
+    /// Returns the conversion result (with unresolved placeholders in markdown),
+    /// pending image data for later resolution (sync or async), and any extracted
+    /// comments (empty unless `options.extract_comments` is set). Comments are
+    /// appended to the output by the caller, after image placeholders resolve.
     pub(crate) fn convert_inner(
         &self,
         data: &[u8],
         options: &ConversionOptions,
-    ) -> Result<(ConversionResult, PendingImageResolution), ConvertError> {
+    ) -> Result<(ConversionResult, PendingImageResolution, Vec<Comment>), ConvertError> {
         let cursor = Cursor::new(data);
         let mut archive = ZipArchive::new(cursor)?;
 
@@ -871,8 +1133,23 @@ impl PptxConverter {
                     ..Default::default()
                 },
                 PendingImageResolution::default(),
+                Vec::new(),
             ));
         }
+
+        // Load comment author registries (legacy + modern) once, if requested.
+        let comment_authors = if options.extract_comments {
+            let mut map = HashMap::new();
+            if let Some(xml) = read_zip_text_lossy(&mut archive, "ppt/commentAuthors.xml")? {
+                map.extend(parse_author_registry(&xml, "cmAuthor"));
+            }
+            if let Some(xml) = read_zip_text_lossy(&mut archive, "ppt/authors.xml")? {
+                map.extend(parse_author_registry(&xml, "author"));
+            }
+            map
+        } else {
+            HashMap::new()
+        };
 
         // 4. Process each slide — collect all image infos and bytes across slides
         let mut slide_markdowns: Vec<String> = Vec::new();
@@ -882,6 +1159,7 @@ impl PptxConverter {
         let mut image_counter: usize = 0;
         let mut all_image_infos: Vec<ImageInfo> = Vec::new();
         let mut all_image_bytes: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut all_comments: Vec<Comment> = Vec::new();
 
         for slide_info in &slides {
             // Read slide XML
@@ -918,6 +1196,46 @@ impl PptxConverter {
             } else {
                 None
             };
+
+            // Extract comments anchored to this slide (legacy + modern schemes).
+            if options.extract_comments {
+                let slide_title = shapes.iter().find_map(|s| match s {
+                    ShapeContent::Title(t) => Some(t.as_str()),
+                    _ => None,
+                });
+                let source = slide_label(slide_info.number, slide_title);
+                // Collect comment-part targets, sorted by path for deterministic
+                // ordering when a slide references more than one comment file.
+                // The modern scheme uses the office/2018/10 namespace; legacy
+                // uses the 2006 one.
+                let mut comment_targets: Vec<(String, bool)> = slide_rels
+                    .values()
+                    .filter(|rel| rel.rel_type.contains("comments"))
+                    .map(|rel| {
+                        let path = resolve_relative_to_file(&slide_info.path, &rel.target);
+                        (path, rel.rel_type.contains("2018"))
+                    })
+                    .collect();
+                comment_targets.sort();
+                // A slide can carry BOTH a modern and a legacy comment part for
+                // back-compat, describing the same threads. Prefer modern and
+                // skip legacy in that case to avoid double-reporting.
+                let has_modern = comment_targets.iter().any(|(_, m)| *m);
+                for (path, is_modern) in comment_targets {
+                    if has_modern && !is_modern {
+                        continue;
+                    }
+                    let Some(xml) = read_zip_text_lossy(&mut archive, &path)? else {
+                        continue;
+                    };
+                    let raw = if is_modern {
+                        parse_modern_comments(&xml, &comment_authors)
+                    } else {
+                        parse_legacy_comments(&xml, &comment_authors)
+                    };
+                    all_comments.extend(build_pptx_comments(raw, &source));
+                }
+            }
 
             // Resolve image filenames and optionally extract image data
             let need_image_bytes = options.extract_images || options.image_describer.is_some();
@@ -1008,7 +1326,7 @@ impl PptxConverter {
             bytes: all_image_bytes,
         };
 
-        Ok((result, pending))
+        Ok((result, pending, all_comments))
     }
 }
 
@@ -1024,7 +1342,7 @@ impl Converter for PptxConverter {
         data: &[u8],
         options: &ConversionOptions,
     ) -> Result<ConversionResult, ConvertError> {
-        let (mut result, pending) = self.convert_inner(data, options)?;
+        let (mut result, pending, doc_comments) = self.convert_inner(data, options)?;
         resolve_image_placeholders(
             &mut result.markdown,
             &mut result.plain_text,
@@ -1033,6 +1351,7 @@ impl Converter for PptxConverter {
             options.image_describer.as_deref(),
             &mut result.warnings,
         );
+        comments::append_comments(&mut result.markdown, &mut result.plain_text, &doc_comments);
         Ok(result)
     }
 }
@@ -2056,5 +2375,331 @@ mod tests {
         let (shapes, warnings) = parse_slide(slide_xml);
         assert!(warnings.is_empty());
         assert!(shapes.is_empty());
+    }
+
+    // ---- Comment extraction tests ----
+
+    // -- unit: author registries --
+
+    #[test]
+    fn test_parse_comment_authors_legacy() {
+        let xml = r#"<?xml version="1.0"?><p:cmAuthorLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cmAuthor id="0" name="Julie Lee" initials="JL"/><p:cmAuthor id="1" name="Sam Park" initials="SP"/></p:cmAuthorLst>"#;
+        let authors = parse_author_registry(xml, "cmAuthor");
+        assert_eq!(authors.get("0").map(|s| s.as_str()), Some("Julie Lee"));
+        assert_eq!(authors.get("1").map(|s| s.as_str()), Some("Sam Park"));
+    }
+
+    #[test]
+    fn test_parse_authors_modern() {
+        let xml = r#"<?xml version="1.0"?><p188:authorLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main"><p188:author id="{GUID-1}" name="Julie Lee" initials="JL" userId="u1" providerId="AD"/></p188:authorLst>"#;
+        let authors = parse_author_registry(xml, "author");
+        assert_eq!(
+            authors.get("{GUID-1}").map(|s| s.as_str()),
+            Some("Julie Lee")
+        );
+    }
+
+    // -- unit: comment files --
+
+    #[test]
+    fn test_parse_legacy_comments() {
+        let mut authors = HashMap::new();
+        authors.insert("0".to_string(), "Julie Lee".to_string());
+        let xml = r#"<?xml version="1.0"?><p:cmLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cm authorId="0" dt="2024-01-15T10:30:00.000" idx="1"><p:pos x="10" y="10"/><p:text>Add a diagram here.</p:text></p:cm></p:cmLst>"#;
+        let raw = parse_legacy_comments(xml, &authors);
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].author, "Julie Lee");
+        assert_eq!(raw[0].date, "2024-01-15T10:30:00.000");
+        assert_eq!(raw[0].body, "Add a diagram here.");
+        assert!(!raw[0].is_reply);
+    }
+
+    #[test]
+    fn test_parse_legacy_comments_unknown_author_empty() {
+        let authors = HashMap::new();
+        let xml = r#"<?xml version="1.0"?><p:cmLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cm authorId="7" dt="2024-01-15T10:30:00.000" idx="1"><p:text>Orphan author.</p:text></p:cm></p:cmLst>"#;
+        let raw = parse_legacy_comments(xml, &authors);
+        assert_eq!(raw[0].author, ""); // resolved to Unknown downstream
+        assert_eq!(raw[0].body, "Orphan author.");
+    }
+
+    #[test]
+    fn test_parse_modern_comments_with_reply() {
+        let mut authors = HashMap::new();
+        authors.insert("{A1}".to_string(), "Alice".to_string());
+        authors.insert("{A2}".to_string(), "Bob".to_string());
+        let xml = r#"<?xml version="1.0"?><p188:cmLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p188:cm id="{C1}" authorId="{A1}" created="2024-01-15T10:30:00.000" status="active"><p188:replyLst><p188:reply id="{C2}" authorId="{A2}" created="2024-01-15T11:00:00.000" status="active"><p188:txBody><a:bodyPr/><a:p><a:r><a:t>Agreed, will fix.</a:t></a:r></a:p></p188:txBody></p188:reply></p188:replyLst><p188:txBody><a:bodyPr/><a:p><a:r><a:t>Needs a clearer title.</a:t></a:r></a:p></p188:txBody></p188:cm></p188:cmLst>"#;
+        let raw = parse_modern_comments(xml, &authors);
+        assert_eq!(raw.len(), 2);
+        // The reply closes first (nested), then the parent.
+        let reply = raw.iter().find(|c| c.is_reply).expect("a reply");
+        let top = raw.iter().find(|c| !c.is_reply).expect("a top-level");
+        assert_eq!(reply.author, "Bob");
+        assert_eq!(reply.body, "Agreed, will fix.");
+        assert_eq!(top.author, "Alice");
+        assert_eq!(top.body, "Needs a clearer title.");
+    }
+
+    #[test]
+    fn test_slide_label() {
+        assert_eq!(
+            slide_label(2, Some("Quarterly Results")),
+            "Slide 2: Quarterly Results"
+        );
+        assert_eq!(slide_label(2, None), "Slide 2");
+        assert_eq!(slide_label(3, Some("   ")), "Slide 3");
+    }
+
+    #[test]
+    fn test_slide_label_collapses_newline_in_title() {
+        // Finding 2: a multi-line title must not inject a newline that breaks the
+        // single-line `- **source**:` list item.
+        let label = slide_label(1, Some("Line1\nLine2"));
+        assert!(!label.contains('\n'), "label has a newline: {label:?}");
+        assert_eq!(label, "Slide 1: Line1 Line2");
+    }
+
+    #[test]
+    fn test_parse_legacy_comments_self_closing_text_no_leak() {
+        // Finding 5: self-closing <p:text/> must not capture stray sibling text.
+        let xml = r#"<?xml version="1.0"?><p:cmLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cm authorId="0" dt="d"><p:text/></p:cm></p:cmLst>"#;
+        let authors = HashMap::new();
+        let raw = parse_legacy_comments(xml, &authors);
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].body, "");
+    }
+
+    #[test]
+    fn test_parse_modern_comments_self_closing_text_no_leak() {
+        // Finding 5: self-closing <a:t/> must not leak text into the body.
+        let xml = r#"<?xml version="1.0"?><p188:cmLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p188:cm authorId="a" created="c"><p188:txBody><a:p><a:r><a:t/></a:r><a:r><a:t>real</a:t></a:r></a:p></p188:txBody></p188:cm></p188:cmLst>"#;
+        let authors = HashMap::new();
+        let raw = parse_modern_comments(xml, &authors);
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].body, "real");
+    }
+
+    #[test]
+    fn test_parse_author_registry_unescapes_name() {
+        // Finding 8: author names must be XML-unescaped.
+        let xml = r#"<?xml version="1.0"?><p:cmAuthorLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cmAuthor id="0" name="Ben &amp; Jerry"/></p:cmAuthorLst>"#;
+        let authors = parse_author_registry(xml, "cmAuthor");
+        assert_eq!(authors.get("0").map(|s| s.as_str()), Some("Ben & Jerry"));
+    }
+
+    // -- integration: build a PPTX with comment parts --
+
+    /// Build a one-slide PPTX with a single legacy or modern comment part.
+    /// `modern` selects the relationship type + comment-file XML scheme.
+    fn build_pptx_with_comment(modern: bool, slide_title: Option<&str>) -> Vec<u8> {
+        use std::io::Write;
+        use zip::ZipWriter;
+        use zip::write::SimpleFileOptions;
+
+        let buf = Vec::new();
+        let mut zip = ZipWriter::new(Cursor::new(buf));
+        let opts = SimpleFileOptions::default();
+
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>"#).unwrap();
+
+        // presentation.xml + rels
+        zip.start_file("ppt/presentation.xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#).unwrap();
+        zip.start_file("ppt/_rels/presentation.xml.rels", opts)
+            .unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#).unwrap();
+
+        // slide1.xml
+        let title_shape = match slide_title {
+            Some(t) => format!(
+                r#"<p:sp><p:nvSpPr><p:cNvPr id="1" name="Title"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>{t}</a:t></a:r></a:p></p:txBody></p:sp>"#
+            ),
+            None => String::new(),
+        };
+        let slide = format!(
+            r#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>{title_shape}</p:spTree></p:cSld></p:sld>"#
+        );
+        zip.start_file("ppt/slides/slide1.xml", opts).unwrap();
+        zip.write_all(slide.as_bytes()).unwrap();
+
+        // slide rels -> comment part
+        let (rel_type, comment_path) = if modern {
+            (
+                "http://schemas.microsoft.com/office/2018/10/relationships/comments",
+                "../comments/modernComment_x.xml",
+            )
+        } else {
+            (
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments",
+                "../comments/comment1.xml",
+            )
+        };
+        zip.start_file("ppt/slides/_rels/slide1.xml.rels", opts)
+            .unwrap();
+        zip.write_all(
+            format!(
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdC" Type="{rel_type}" Target="{comment_path}"/></Relationships>"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+        if modern {
+            zip.start_file("ppt/authors.xml", opts).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><p188:authorLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main"><p188:author id="{A1}" name="Alice" userId="u" providerId="AD"/><p188:author id="{A2}" name="Bob" userId="u" providerId="AD"/></p188:authorLst>"#).unwrap();
+            zip.start_file("ppt/comments/modernComment_x.xml", opts)
+                .unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><p188:cmLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p188:cm id="{C1}" authorId="{A1}" created="2024-01-15T10:30:00.000"><p188:replyLst><p188:reply id="{C2}" authorId="{A2}" created="2024-01-15T11:00:00.000"><p188:txBody><a:bodyPr/><a:p><a:r><a:t>Agreed.</a:t></a:r></a:p></p188:txBody></p188:reply></p188:replyLst><p188:txBody><a:bodyPr/><a:p><a:r><a:t>Please clarify.</a:t></a:r></a:p></p188:txBody></p188:cm></p188:cmLst>"#).unwrap();
+        } else {
+            zip.start_file("ppt/commentAuthors.xml", opts).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><p:cmAuthorLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cmAuthor id="0" name="Julie Lee" initials="JL"/></p:cmAuthorLst>"#).unwrap();
+            zip.start_file("ppt/comments/comment1.xml", opts).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><p:cmLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cm authorId="0" dt="2024-01-15T10:30:00.000" idx="1"><p:pos x="10" y="10"/><p:text>Add a diagram here.</p:text></p:cm></p:cmLst>"#).unwrap();
+        }
+
+        let cursor = zip.finish().unwrap();
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn test_pptx_legacy_comments_end_to_end() {
+        let data = build_pptx_with_comment(false, Some("Overview"));
+        let options = ConversionOptions {
+            extract_comments: true,
+            ..Default::default()
+        };
+        let result = PptxConverter.convert(&data, &options).unwrap();
+        assert!(
+            result.markdown.contains("# Comments"),
+            "md: {}",
+            result.markdown
+        );
+        assert!(result.markdown.contains("## 1"));
+        assert!(
+            result
+                .markdown
+                .contains("- **author**: Julie Lee (2024-01-15T10:30:00.000)")
+        );
+        assert!(
+            result
+                .markdown
+                .contains("- **comment**: Add a diagram here.")
+        );
+        assert!(result.markdown.contains("- **source**: Slide 1: Overview"));
+    }
+
+    #[test]
+    fn test_pptx_modern_comments_with_reply_end_to_end() {
+        let data = build_pptx_with_comment(true, None);
+        let options = ConversionOptions {
+            extract_comments: true,
+            ..Default::default()
+        };
+        let result = PptxConverter.convert(&data, &options).unwrap();
+        assert!(
+            result.markdown.contains("# Comments"),
+            "md: {}",
+            result.markdown
+        );
+        assert!(result.markdown.contains("- **comment**: Please clarify."));
+        assert!(
+            result.markdown.contains("- **comment**: (reply) Agreed."),
+            "reply not marked, md: {}",
+            result.markdown
+        );
+        // Parent comment must be emitted before its reply (document order).
+        let parent = result.markdown.find("Please clarify.").unwrap();
+        let reply = result.markdown.find("(reply) Agreed.").unwrap();
+        assert!(
+            parent < reply,
+            "parent must precede reply, md: {}",
+            result.markdown
+        );
+        // No slide title -> bare "Slide 1".
+        assert!(result.markdown.contains("- **source**: Slide 1\n"));
+    }
+
+    #[test]
+    fn test_pptx_comments_absent_when_flag_off() {
+        let data = build_pptx_with_comment(false, Some("Overview"));
+        let result = PptxConverter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        assert!(!result.markdown.contains("# Comments"));
+    }
+
+    #[test]
+    fn test_pptx_comments_plain_text_stripped() {
+        let data = build_pptx_with_comment(false, Some("Overview"));
+        let options = ConversionOptions {
+            extract_comments: true,
+            ..Default::default()
+        };
+        let result = PptxConverter.convert(&data, &options).unwrap();
+        assert!(result.plain_text.contains("Comments\n"));
+        assert!(
+            result
+                .plain_text
+                .contains("author: Julie Lee (2024-01-15T10:30:00.000)")
+        );
+        assert!(result.plain_text.contains("source: Slide 1: Overview"));
+        assert!(!result.plain_text.contains("# Comments"));
+        assert!(!result.plain_text.contains("**"));
+    }
+
+    #[test]
+    fn test_pptx_dual_scheme_no_double_report() {
+        // Finding 2: a slide referencing BOTH a legacy and a modern comment part
+        // (same thread, for back-compat) must not report the comment twice.
+        use std::io::Write;
+        use zip::ZipWriter;
+        use zip::write::SimpleFileOptions;
+
+        let buf = Vec::new();
+        let mut zip = ZipWriter::new(Cursor::new(buf));
+        let opts = SimpleFileOptions::default();
+
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>"#).unwrap();
+        zip.start_file("ppt/presentation.xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#).unwrap();
+        zip.start_file("ppt/_rels/presentation.xml.rels", opts)
+            .unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#).unwrap();
+        zip.start_file("ppt/slides/slide1.xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree/></p:cSld></p:sld>"#).unwrap();
+        // Slide rels carry BOTH a legacy and a modern comments relationship.
+        zip.start_file("ppt/slides/_rels/slide1.xml.rels", opts)
+            .unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdL" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments/comment1.xml"/><Relationship Id="rIdM" Type="http://schemas.microsoft.com/office/2018/10/relationships/comments" Target="../comments/modernComment_x.xml"/></Relationships>"#).unwrap();
+        zip.start_file("ppt/commentAuthors.xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><p:cmAuthorLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cmAuthor id="0" name="Dana"/></p:cmAuthorLst>"#).unwrap();
+        zip.start_file("ppt/comments/comment1.xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><p:cmLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cm authorId="0" dt="d" idx="1"><p:text>Shared thread.</p:text></p:cm></p:cmLst>"#).unwrap();
+        zip.start_file("ppt/authors.xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><p188:authorLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main"><p188:author id="{A}" name="Dana" userId="u" providerId="AD"/></p188:authorLst>"#).unwrap();
+        zip.start_file("ppt/comments/modernComment_x.xml", opts)
+            .unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><p188:cmLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p188:cm authorId="{A}" created="c"><p188:txBody><a:p><a:r><a:t>Shared thread.</a:t></a:r></a:p></p188:txBody></p188:cm></p188:cmLst>"#).unwrap();
+
+        let data = zip.finish().unwrap().into_inner();
+        let options = ConversionOptions {
+            extract_comments: true,
+            ..Default::default()
+        };
+        let result = PptxConverter.convert(&data, &options).unwrap();
+        // Exactly one comment, not two.
+        assert_eq!(
+            result
+                .markdown
+                .matches("- **comment**: Shared thread.")
+                .count(),
+            1,
+            "comment double-reported, md: {}",
+            result.markdown
+        );
+        assert!(result.markdown.contains("## 1"));
+        assert!(!result.markdown.contains("## 2"));
     }
 }

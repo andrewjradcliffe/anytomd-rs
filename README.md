@@ -252,6 +252,9 @@ anytomd --plain-text document.docx
 # Plain text from stdin
 echo "Name,Age" | anytomd --format csv --plain-text
 
+# Extract comments (DOCX/PPTX) into an appended Comments section
+anytomd --extract-comments document.docx
+
 # Image descriptions via Gemini (requires GEMINI_API_KEY env var)
 export GEMINI_API_KEY=your-key
 anytomd --gemini presentation.pptx
@@ -319,6 +322,47 @@ for (filename, bytes) in &result.images {
     std::fs::write(filename, bytes).unwrap();
 }
 ```
+
+### Extracting Comments (DOCX / PPTX)
+
+Setting `extract_comments` appends a `# Comments` section to the end of the
+output (both Markdown and plain text). Each comment records the commenter, the
+comment body, and the source — the commented-on text for DOCX, or the slide
+label for PPTX (whose comments are anchored to a point, not a text span).
+Replies are flattened and marked `(reply)`; the flag is a no-op for other
+formats.
+
+```rust
+use anytomd::{convert_file, ConversionOptions};
+
+let options = ConversionOptions {
+    extract_comments: true,
+    ..Default::default()
+};
+let result = convert_file("document.docx", &options).unwrap();
+println!("{}", result.markdown);
+```
+
+Example appended section:
+
+```markdown
+# Comments
+
+## 1
+- **author**: Jane Smith (2024-01-15T09:30:00Z)
+- **comment**: Please revise this paragraph.
+- **source**: the quick brown fox
+```
+
+Notes:
+
+- **DOCX:** commenter identity comes from the comment author and date; the
+  source is the commented-on text (collapsed to one line, capped at 200
+  characters). Ranges in the body, headers, footers, footnotes, and endnotes
+  are all scanned. Threaded replies are detected via `commentsExtended.xml`.
+- **PPTX:** both the legacy (`commentAuthors.xml`) and modern
+  (`authors.xml` / threaded) comment schemes are supported. The source is the
+  slide label (e.g. `Slide 2: Quarterly Results`).
 
 ### LLM-Based Image Descriptions
 
@@ -438,6 +482,7 @@ pub async fn convert_bytes_async(
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `extract_images` | `bool` | `false` | Extract embedded images into `result.images` |
+| `extract_comments` | `bool` | `false` | Append a `# Comments` section (DOCX/PPTX only) |
 | `max_total_image_bytes` | `usize` | 50 MB | Hard cap for total extracted image bytes |
 | `max_input_bytes` | `usize` | 100 MB | Maximum input file size |
 | `max_uncompressed_zip_bytes` | `usize` | 500 MB | ZIP bomb guard |
