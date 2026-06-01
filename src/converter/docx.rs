@@ -311,6 +311,12 @@ struct SavedParagraphState {
     in_num_pr: bool,
     current_num_id: Option<String>,
     current_ilvl: Option<u8>,
+    /// Whether the enclosing table frame had an open cell/row when the text box
+    /// was entered. Text-box content is a separate flow, so these are cleared on
+    /// entry (so the content does not leak into the surrounding cell) and
+    /// restored on exit.
+    table_in_cell: bool,
+    table_in_row: bool,
 }
 
 // ---- Table model ----
@@ -439,13 +445,23 @@ fn join_cell_blocks_plain(cell: &DocxCell) -> String {
 fn expand_row_to_grid(row: &DocxRow, grid_width: usize, plain: bool) -> Vec<String> {
     let mut cols: Vec<String> = Vec::with_capacity(grid_width);
     for c in &row.cells {
-        let span = c.grid_span.max(1);
-        let text = if c.v_merge == VMerge::Continue {
-            String::new()
-        } else if plain {
+        // Clamp the span to the columns still available so a malformed span value
+        // can never push the row past `grid_width`.
+        let remaining = grid_width.saturating_sub(cols.len());
+        let span = c.grid_span.max(1).min(remaining.max(1));
+        let content = if plain {
             join_cell_blocks_plain(c)
         } else {
             join_cell_blocks_md(c)
+        };
+        // A genuine vertical-merge continuation cell is empty in the source, so it
+        // renders empty. But if a continuation cell carries text (an orphan merge
+        // with no matching restart, or malformed input), keep it rather than
+        // silently dropping content.
+        let text = if c.v_merge == VMerge::Continue && content.is_empty() {
+            String::new()
+        } else {
+            content
         };
         cols.push(text);
         for _ in 1..span {
@@ -543,8 +559,10 @@ fn render_docx_table(table: &DocxTable) -> (String, String) {
                 if text.is_empty() {
                     continue;
                 }
-                // Heading if the banner's first paragraph is heading-styled.
-                let level = cell.blocks.first().and_then(|b| match b.kind {
+                // Heading if any of the banner's paragraphs is heading-styled
+                // (a banner cell often has a blank leading paragraph before the
+                // heading-styled title).
+                let level = cell.blocks.iter().find_map(|b| match b.kind {
                     ParagraphKind::Heading(l) => Some(l),
                     _ => None,
                 });
@@ -558,7 +576,9 @@ fn render_docx_table(table: &DocxTable) -> (String, String) {
             }
             DocxSegment::LabelValue(row) => {
                 let label = join_cell_blocks_md(&row.cells[0]);
-                let label = label.trim_end_matches(':').to_string();
+                // Strip a single trailing colon if present (we re-add exactly one);
+                // do not collapse multiple colons in labels like "Ratio::".
+                let label = label.strip_suffix(':').unwrap_or(&label).to_string();
                 let value_cell = &row.cells[1];
                 // Markdown: bold label + first value paragraph inline, rest on
                 // following lines (paragraph breaks preserved).
@@ -580,7 +600,7 @@ fn render_docx_table(table: &DocxTable) -> (String, String) {
                 }
                 // Plain: fully flattened — label line then each value paragraph.
                 let label_plain = join_cell_blocks_plain(&row.cells[0]);
-                let label_plain = label_plain.trim_end_matches(':');
+                let label_plain = label_plain.strip_suffix(':').unwrap_or(&label_plain);
                 plain.push_str(label_plain);
                 plain.push('\n');
                 for b in value_cell
@@ -604,21 +624,19 @@ fn render_docx_table(table: &DocxTable) -> (String, String) {
                 if docx_row_has_nested_table(row) {
                     // The row carries a nested table: emit each block in place —
                     // paragraphs as text, the nested table as a standalone block.
+                    // Every block is followed by a blank line so a sibling cell's
+                    // text after a nested table is not glued on as a table row.
                     for c in &row.cells {
                         for b in &c.blocks {
                             if b.md.trim().is_empty() {
                                 continue;
                             }
                             md.push_str(b.md.trim_end());
-                            md.push('\n');
-                            if !b.is_table {
-                                md.push('\n');
-                            }
+                            md.push_str("\n\n");
                             plain.push_str(b.plain.trim_end());
                             plain.push('\n');
                         }
                     }
-                    md.push('\n');
                     plain.push('\n');
                 } else {
                     // Small standalone GFM table padded to the row's own cell count.
@@ -647,14 +665,18 @@ fn render_docx_table(table: &DocxTable) -> (String, String) {
 /// authoritative). Falls back to the maximum over rows of the summed `grid_span`
 /// when the grid is absent or unparsed.
 fn docx_grid_width(t: &DocxTable) -> usize {
-    if t.grid_width > 0 {
-        return t.grid_width;
-    }
-    t.rows
-        .iter()
-        .map(|r| r.cells.iter().map(|c| c.grid_span.max(1)).sum::<usize>())
-        .max()
-        .unwrap_or(0)
+    let width = if t.grid_width > 0 {
+        t.grid_width
+    } else {
+        t.rows
+            .iter()
+            .map(|r| r.cells.iter().map(|c| c.grid_span.max(1)).sum::<usize>())
+            .max()
+            .unwrap_or(0)
+    };
+    // Bound the rendered grid width so an extreme span/gridCol count cannot drive
+    // unbounded column allocation downstream.
+    width.min(MAX_TABLE_COLS)
 }
 
 /// Whether a row's cells exactly tile the full grid width.
@@ -703,11 +725,13 @@ fn classify_docx_row(row: &DocxRow, grid_width: usize) -> DocxRowKind {
     // Label/value: narrow label (1 column) + wide value cell that genuinely
     // spans the remaining columns. The value must span at least 2 columns (so
     // `grid_width >= 3`); in a 2-column grid a `[1, 1]` row is an ordinary data
-    // row, not a label/value pair.
+    // row, not a label/value pair. The label cell must be non-empty — an empty
+    // label (e.g. a vertical-merge placeholder) would render a bare `**:**`.
     if cells.len() == 2
         && grid_width >= 3
         && cells[0].grid_span.max(1) == 1
         && cells[1].grid_span.max(1) == grid_width - 1
+        && !join_cell_blocks_md(&cells[0]).trim().is_empty()
     {
         return DocxRowKind::LabelValue;
     }
@@ -954,7 +978,16 @@ fn parse_document(
                             in_num_pr,
                             current_num_id: current_num_id.clone(),
                             current_ilvl,
+                            table_in_cell: table_stack.last().is_some_and(|f| f.in_cell),
+                            table_in_row: table_stack.last().is_some_and(|f| f.in_row),
                         });
+                        // A text box is a separate content flow: detach it from any
+                        // enclosing table cell so its paragraphs (and nested tables)
+                        // render to the main output rather than leaking into the cell.
+                        if let Some(frame) = table_stack.last_mut() {
+                            frame.in_cell = false;
+                            frame.in_row = false;
+                        }
                         // Reset paragraph-level state for text box content
                         in_paragraph = false;
                         in_run = false;
@@ -981,6 +1014,15 @@ fn parse_document(
                         continue;
                     }
                     _ => {}
+                }
+
+                // Table-property elements (gridCol/gridSpan/vMerge) may be serialized
+                // in long form (Start+End) rather than self-closing, so handle them here
+                // as well as in the Event::Empty arm.
+                if let Some(frame) = table_stack.last_mut()
+                    && apply_table_property(local_str, e, frame)
+                {
+                    continue;
                 }
 
                 match local_str {
@@ -1121,27 +1163,13 @@ fn parse_document(
                 let local = e.local_name();
                 let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
 
+                if let Some(frame) = table_stack.last_mut()
+                    && apply_table_property(local_str, e, frame)
+                {
+                    continue;
+                }
+
                 match local_str {
-                    // `<w:gridCol>` inside `<w:tblGrid>` defines one grid column;
-                    // counting them yields the authoritative table width.
-                    "gridCol" if table_stack.last().is_some_and(|f| !f.in_row) => {
-                        table_stack.last_mut().unwrap().grid_width += 1;
-                    }
-                    // `<w:gridSpan w:val="N"/>` in `<w:tcPr>`: horizontal merge.
-                    "gridSpan" if table_stack.last().is_some_and(|f| f.in_cell) => {
-                        if let Some(n) = read_w_val(e).and_then(|v| v.parse::<usize>().ok()) {
-                            table_stack.last_mut().unwrap().current_cell.grid_span = n.max(1);
-                        }
-                    }
-                    // `<w:vMerge .../>` in `<w:tcPr>`: vertical merge. `w:val="restart"`
-                    // starts a merge; a bare `<w:vMerge/>` (or any other value) continues one.
-                    "vMerge" if table_stack.last().is_some_and(|f| f.in_cell) => {
-                        let v = match read_w_val(e).as_deref() {
-                            Some("restart") => VMerge::Restart,
-                            _ => VMerge::Continue,
-                        };
-                        table_stack.last_mut().unwrap().current_cell.v_merge = v;
-                    }
                     "pStyle" if in_para_properties => {
                         for attr in e.attributes().flatten() {
                             let local_name = attr.key.local_name();
@@ -1284,6 +1312,11 @@ fn parse_document(
                         in_num_pr = saved.in_num_pr;
                         current_num_id = saved.current_num_id;
                         current_ilvl = saved.current_ilvl;
+                        // Re-attach to the enclosing table cell, if any.
+                        if let Some(frame) = table_stack.last_mut() {
+                            frame.in_cell = saved.table_in_cell;
+                            frame.in_row = saved.table_in_row;
+                        }
                     }
                     continue;
                 }
@@ -1513,6 +1546,56 @@ fn parse_document(
     };
 
     (markdown, plain_text, title, warnings, image_infos)
+}
+
+/// Upper bound on table columns / cell span.
+///
+/// Caps `gridSpan`/`gridCol` so a malformed or hostile document with a huge span
+/// value cannot drive unbounded allocation when a row is expanded to the grid
+/// width. Far larger than any real table.
+const MAX_TABLE_COLS: usize = 4096;
+
+/// Parse a `<w:tblGrid>`/`<w:tcPr>` child element (`gridCol`, `gridSpan`,
+/// `vMerge`) into the current table frame.
+///
+/// Word may serialize these as self-closing (`Event::Empty`) or as separately
+/// closed (`Event::Start` + `Event::End`) elements, so both event arms call this.
+/// Returns `true` if the element was a recognized table-property element.
+fn apply_table_property(
+    local_str: &str,
+    e: &quick_xml::events::BytesStart,
+    frame: &mut DocxTable,
+) -> bool {
+    match local_str {
+        // `<w:gridCol>` inside `<w:tblGrid>` defines one grid column; counting
+        // them yields the authoritative table width.
+        "gridCol" if !frame.in_row => {
+            if frame.grid_width < MAX_TABLE_COLS {
+                frame.grid_width += 1;
+            }
+            true
+        }
+        // `<w:gridSpan w:val="N"/>` in `<w:tcPr>`: horizontal merge.
+        "gridSpan" if frame.in_cell => {
+            if let Some(n) = read_w_val(e).and_then(|v| v.parse::<usize>().ok()) {
+                frame.current_cell.grid_span = n.clamp(1, MAX_TABLE_COLS);
+            }
+            true
+        }
+        // `<w:vMerge .../>` in `<w:tcPr>`: vertical merge. `w:val="restart"` starts
+        // a merge; a bare `<w:vMerge/>` continues one. An explicit falsey value
+        // (`0`/`false`) means "not merged".
+        "vMerge" if frame.in_cell => {
+            let v = match read_w_val(e).as_deref() {
+                Some("restart") => VMerge::Restart,
+                Some(other) if other == "0" || other.eq_ignore_ascii_case("false") => VMerge::None,
+                _ => VMerge::Continue,
+            };
+            frame.current_cell.v_merge = v;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Read the `w:val` attribute of an element, if present (namespace-agnostic).
@@ -3143,8 +3226,22 @@ mod tests {
 
     #[test]
     fn test_docx_expand_row_vmerge_continue_empty() {
-        let r = row(vec![cell("kept", 1, VMerge::Continue)]);
+        // A genuine vertical-merge continuation cell is empty in the source, so it
+        // renders empty.
+        let r = row(vec![DocxCell {
+            grid_span: 1,
+            v_merge: VMerge::Continue,
+            blocks: vec![],
+        }]);
         assert_eq!(expand_row_to_grid(&r, 1, false), vec![""]);
+    }
+
+    #[test]
+    fn test_docx_expand_row_vmerge_continue_with_text_preserved() {
+        // An orphan continuation cell that carries text (no matching restart, or
+        // malformed input) keeps its content rather than silently dropping it.
+        let r = row(vec![cell("kept", 1, VMerge::Continue)]);
+        assert_eq!(expand_row_to_grid(&r, 1, false), vec!["kept"]);
     }
 
     #[test]
@@ -3322,6 +3419,84 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(render_docx_table(&t), render_docx_table(&t));
+    }
+
+    #[test]
+    fn test_docx_render_label_value_double_colon_preserved() {
+        // A label ending in more than one colon must not have colons collapsed:
+        // only a single trailing colon is normalized away before re-adding one.
+        let t = DocxTable {
+            grid_width: 3,
+            rows: vec![row(vec![
+                cell("Ratio::", 1, VMerge::None),
+                cell("v", 2, VMerge::None),
+            ])],
+            ..Default::default()
+        };
+        let (md, _) = render_docx_table(&t);
+        assert!(md.contains("**Ratio::** v"), "md: {md}");
+    }
+
+    #[test]
+    fn test_docx_render_banner_heading_not_first_block() {
+        // A banner cell whose heading-styled paragraph is preceded by an empty
+        // paragraph is still promoted to a heading.
+        let t = DocxTable {
+            grid_width: 2,
+            rows: vec![
+                row(vec![DocxCell {
+                    grid_span: 2,
+                    v_merge: VMerge::None,
+                    blocks: vec![
+                        DocxCellBlock {
+                            md: String::new(),
+                            plain: String::new(),
+                            kind: ParagraphKind::Normal,
+                            is_table: false,
+                        },
+                        DocxCellBlock {
+                            md: "Title".to_string(),
+                            plain: "Title".to_string(),
+                            kind: ParagraphKind::Heading(2),
+                            is_table: false,
+                        },
+                    ],
+                }]),
+                row(vec![cell("a", 1, VMerge::None), cell("b", 1, VMerge::None)]),
+            ],
+            ..Default::default()
+        };
+        let (md, _) = render_docx_table(&t);
+        assert!(md.contains("## Title"), "banner not promoted: {md}");
+    }
+
+    #[test]
+    fn test_docx_render_empty_label_not_label_value() {
+        // A [empty label, wide value] row must not render a bare `**:**` artifact.
+        let t = DocxTable {
+            grid_width: 3,
+            rows: vec![row(vec![
+                cell("", 1, VMerge::None),
+                cell("wide", 2, VMerge::None),
+            ])],
+            ..Default::default()
+        };
+        let (md, _) = render_docx_table(&t);
+        assert!(!md.contains("**:**"), "empty-label artifact: {md}");
+    }
+
+    #[test]
+    fn test_docx_grid_width_bounded() {
+        // A pathological gridSpan cannot drive an unbounded grid width.
+        let t = DocxTable {
+            grid_width: 0,
+            rows: vec![row(vec![cell("x", 100_000_000, VMerge::None)])],
+            ..Default::default()
+        };
+        assert!(docx_grid_width(&t) <= MAX_TABLE_COLS);
+        // Expanding the row must not allocate beyond the bound.
+        let cols = expand_row_to_grid(&t.rows[0], docx_grid_width(&t), false);
+        assert!(cols.len() <= MAX_TABLE_COLS);
     }
 
     #[test]

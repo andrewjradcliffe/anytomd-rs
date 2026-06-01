@@ -485,3 +485,102 @@ fn test_docx_layout_table_golden() {
     let expected = include_str!("fixtures/expected/layout_table.docx.md");
     assert_eq!(normalize(&result.markdown), normalize(expected));
 }
+
+/// Regression (review finding): a long-form `<w:gridSpan></w:gridSpan>` (not
+/// self-closing) must still be parsed, so a full-width banner linearizes rather
+/// than collapsing the table to one column.
+#[test]
+fn test_docx_long_form_gridspan_parsed() {
+    let body = concat!(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="1"/><w:gridCol w:w="1"/></w:tblGrid>"#,
+        r#"<w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"></w:gridSpan></w:tcPr><w:p><w:r><w:t>Banner</w:t></w:r></w:p></w:tc></w:tr>"#,
+        r#"<w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+    );
+    let data = build_docx_from_body(body, None);
+    let result = anytomd::convert_bytes(&data, "docx", &ConversionOptions::default()).unwrap();
+    assert!(
+        result.markdown.contains("**Banner**"),
+        "md: {}",
+        result.markdown
+    );
+    assert!(
+        result.markdown.contains("| A | B |"),
+        "md: {}",
+        result.markdown
+    );
+}
+
+/// Regression (review finding): an orphan vMerge continuation cell that carries
+/// text (no matching restart) must not silently drop its content.
+#[test]
+fn test_docx_orphan_vmerge_preserves_text() {
+    let body = concat!(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="1"/><w:gridCol w:w="1"/></w:tblGrid>"#,
+        r#"<w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p><w:r><w:t>OrphanText</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>sib</w:t></w:r></w:p></w:tc></w:tr>"#,
+        r#"<w:tr><w:tc><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>y</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+    );
+    let data = build_docx_from_body(body, None);
+    let result = anytomd::convert_bytes(&data, "docx", &ConversionOptions::default()).unwrap();
+    assert!(
+        result.markdown.contains("OrphanText"),
+        "md: {}",
+        result.markdown
+    );
+    assert!(
+        result.plain_text.contains("OrphanText"),
+        "plain: {}",
+        result.plain_text
+    );
+}
+
+/// Regression (review finding): a table inside a text box inside a table cell must
+/// not scramble document order. The outer cell text and the inner table both
+/// appear, and the inner table is not emitted ahead of the surrounding content.
+#[test]
+fn test_docx_textbox_table_in_cell_no_reorder() {
+    let body = concat!(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="1"/></w:tblGrid><w:tr><w:tc>"#,
+        r#"<w:p><w:r><w:t>outer-before</w:t></w:r>"#,
+        r#"<w:r><w:pict><v:shape><v:textbox><w:txbxContent>"#,
+        r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>inner-cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+        r#"</w:txbxContent></v:textbox></v:shape></w:pict></w:r>"#,
+        r#"<w:r><w:t>outer-after</w:t></w:r></w:p>"#,
+        r#"</w:tc></w:tr></w:tbl>"#,
+    );
+    let data = build_docx_from_body(body, None);
+    let result = anytomd::convert_bytes(&data, "docx", &ConversionOptions::default()).unwrap();
+    // All content present.
+    for needle in ["outer-before", "inner-cell", "outer-after"] {
+        assert!(
+            result.markdown.contains(needle),
+            "missing {needle}: {}",
+            result.markdown
+        );
+    }
+    // The outer paragraph text is kept together (not split around the inner table).
+    assert!(
+        result.markdown.contains("outer-before") && result.markdown.contains("outer-after"),
+        "md: {}",
+        result.markdown
+    );
+}
+
+/// Regression (review finding): a huge gridSpan must not drive unbounded
+/// allocation; conversion completes quickly with bounded output.
+#[test]
+fn test_docx_huge_gridspan_bounded() {
+    let body = concat!(
+        r#"<w:tbl>"#,
+        r#"<w:tr><w:tc><w:tcPr><w:gridSpan w:val="1000000"/></w:tcPr><w:p><w:r><w:t>X</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Y</w:t></w:r></w:p></w:tc></w:tr>"#,
+        r#"<w:tr><w:tc><w:tcPr><w:gridSpan w:val="1000000"/></w:tcPr><w:p><w:r><w:t>P</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Q</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+    );
+    let data = build_docx_from_body(body, None);
+    let result = anytomd::convert_bytes(&data, "docx", &ConversionOptions::default()).unwrap();
+    // Bounded output (not megabytes of empty pipes).
+    assert!(
+        result.markdown.len() < 100_000,
+        "output not bounded: {} bytes",
+        result.markdown.len()
+    );
+    assert!(result.markdown.contains('X'));
+}

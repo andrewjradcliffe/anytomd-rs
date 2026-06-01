@@ -11,6 +11,17 @@ use crate::markdown;
 use ego_tree::iter::Edge;
 use scraper::{Html, Node};
 
+/// Upper bound on table columns / per-cell colspan.
+///
+/// Caps `colspan` so a malformed or hostile attribute cannot drive unbounded
+/// allocation when a row is expanded to the grid width. Far larger than any real
+/// table.
+const MAX_TABLE_COLS: usize = 4096;
+
+/// Upper bound on a cell's `rowspan`, limiting how many placeholder rows a single
+/// vertical span can materialize.
+const MAX_TABLE_ROWS: usize = 4096;
+
 /// Converts HTML files to Markdown.
 pub struct HtmlConverter;
 
@@ -109,6 +120,19 @@ struct HtmlCell {
     heading_level: u8,
     /// Accumulated cell text.
     content: String,
+    /// Rendered markdown of a nested table inside this cell, if any. Kept
+    /// separate from `content` so it is emitted as a standalone block rather than
+    /// escaped into a single grid cell.
+    nested_md: String,
+    /// Plain-text form of the nested table, paired with `nested_md`.
+    nested_plain: String,
+}
+
+impl HtmlCell {
+    /// Whether this cell contains a rendered nested table.
+    fn has_nested_table(&self) -> bool {
+        !self.nested_md.is_empty()
+    }
 }
 
 /// One buffered HTML table row.
@@ -300,10 +324,19 @@ fn handle_open(state: &mut WalkerState, node: &ego_tree::NodeRef<Node>) {
                     // text is still accumulated normally (no heading markers).
                     if let Some(tc) = state.table_stack.last_mut()
                         && tc.in_cell
-                        && !tc.current_cell.has_heading
                     {
-                        tc.current_cell.has_heading = true;
-                        tc.current_cell.heading_level = level;
+                        // Headings are block elements: separate their text from any
+                        // preceding cell content so multiple headings in one cell do
+                        // not mash together (e.g. "FirstSecond").
+                        let cur = &mut tc.current_cell.content;
+                        if !cur.is_empty() && !cur.ends_with(char::is_whitespace) {
+                            cur.push(' ');
+                        }
+                        // Record the first heading's level for banner promotion.
+                        if !tc.current_cell.has_heading {
+                            tc.current_cell.has_heading = true;
+                            tc.current_cell.heading_level = level;
+                        }
                     }
                     if !state.in_table_cell() {
                         state.both_ensure_blank_line();
@@ -415,23 +448,24 @@ fn handle_open(state: &mut WalkerState, node: &ego_tree::NodeRef<Node>) {
                     }
                 }
                 "th" | "td" => {
+                    // Clamp colspan/rowspan so a hostile attribute (e.g.
+                    // colspan="2000000000") cannot drive unbounded allocation when
+                    // the row is expanded to the grid width.
                     let colspan = el
                         .attr("colspan")
                         .and_then(|v| v.trim().parse::<usize>().ok())
                         .unwrap_or(1)
-                        .max(1);
+                        .clamp(1, MAX_TABLE_COLS);
                     let rowspan = el
                         .attr("rowspan")
                         .and_then(|v| v.trim().parse::<usize>().ok())
                         .unwrap_or(1)
-                        .max(1);
+                        .clamp(1, MAX_TABLE_ROWS);
                     if let Some(tc) = state.table_stack.last_mut() {
                         tc.current_cell = HtmlCell {
                             colspan,
                             rowspan,
-                            has_heading: false,
-                            heading_level: 0,
-                            content: String::new(),
+                            ..Default::default()
                         };
                         tc.in_cell = true;
                     }
@@ -575,15 +609,20 @@ fn handle_close(state: &mut WalkerState, node: &ego_tree::NodeRef<Node>) {
                     let table_md = render_table(&tc, false);
                     let table_plain = render_table(&tc, true);
                     if state.table_stack.last().is_some_and(|p| p.in_cell) {
-                        // Nested table: append its rendered output into the
-                        // enclosing cell so it renders in place.
+                        // Nested table: stash its rendered output on the enclosing
+                        // cell (kept apart from the cell's text). The cell's row is
+                        // then linearized so the nested table renders as a block
+                        // instead of being escaped into a single grid cell.
                         let parent = state.table_stack.last_mut().unwrap();
-                        if !parent.current_cell.content.is_empty()
-                            && !parent.current_cell.content.ends_with('\n')
-                        {
-                            parent.current_cell.content.push('\n');
+                        if !parent.current_cell.nested_md.is_empty() {
+                            parent.current_cell.nested_md.push('\n');
+                            parent.current_cell.nested_plain.push('\n');
                         }
-                        parent.current_cell.content.push_str(table_md.trim_end());
+                        parent.current_cell.nested_md.push_str(table_md.trim_end());
+                        parent
+                            .current_cell
+                            .nested_plain
+                            .push_str(table_plain.trim_end());
                     } else {
                         state.push_str(&table_md);
                         state.plain_push_str(&table_plain);
@@ -799,11 +838,15 @@ fn normalize_html_rowspans(rows: &[HtmlRow]) -> Vec<HtmlRow> {
 }
 
 /// Authoritative grid width of an HTML table: the max over rows of summed colspan.
+///
+/// Bounded by `MAX_TABLE_COLS` so an extreme colspan cannot drive unbounded
+/// column allocation downstream.
 fn html_grid_width(rows: &[HtmlRow]) -> usize {
     rows.iter()
         .map(|r| r.cells.iter().map(|c| c.colspan.max(1)).sum::<usize>())
         .max()
         .unwrap_or(0)
+        .min(MAX_TABLE_COLS)
 }
 
 /// Whether a row's cells exactly tile the full grid width.
@@ -820,16 +863,31 @@ enum HtmlRowKind {
     Fallback,
 }
 
+/// Whether any cell in the row contains a nested table.
+///
+/// Such rows cannot be flattened into single grid cells, so they are linearized
+/// (classified `Fallback`) and their nested tables emitted as standalone blocks.
+fn html_row_has_nested_table(row: &HtmlRow) -> bool {
+    row.cells.iter().any(|c| c.has_nested_table())
+}
+
 /// Classify a single HTML row by its cell layout. First matching rule wins.
 fn classify_html_row(row: &HtmlRow, grid_width: usize) -> HtmlRowKind {
     let cells = &row.cells;
+    // A row whose cell holds a nested table cannot become a grid cell; linearize.
+    if html_row_has_nested_table(row) {
+        return HtmlRowKind::Fallback;
+    }
     if cells.len() == 1 && grid_width >= 1 && cells[0].colspan.max(1) >= grid_width {
         return HtmlRowKind::Banner;
     }
+    // Label/value requires a non-empty label cell — an empty label (e.g. a
+    // vertical-merge placeholder) would render a bare `**:**`.
     if cells.len() == 2
         && grid_width >= 3
         && cells[0].colspan.max(1) == 1
         && cells[1].colspan.max(1) == grid_width - 1
+        && !cells[0].content.trim().is_empty()
     {
         return HtmlRowKind::LabelValue;
     }
@@ -846,6 +904,16 @@ fn classify_html_row(row: &HtmlRow, grid_width: usize) -> HtmlRowKind {
 fn html_table_is_simple(rows: &[HtmlRow]) -> bool {
     if rows.is_empty() {
         return true;
+    }
+    // A nested table inside any cell forces the hybrid path so the inner table is
+    // emitted as a standalone block rather than escaped into a single cell.
+    if rows.iter().any(html_row_has_nested_table) {
+        return false;
+    }
+    // More than one header row cannot be represented by a single GFM header, so
+    // route it through the hybrid path (which renders header rows as a grid).
+    if rows.iter().filter(|r| r.is_header_row).count() > 1 {
+        return false;
     }
     let width = rows[0].cells.len();
     rows.iter()
@@ -960,7 +1028,9 @@ fn render_table(tc: &TableCollector, plain: bool) -> String {
             }
             HtmlRowKind::LabelValue => {
                 flush_grid(&mut grid_run, &mut out);
-                let label = row.cells[0].content.trim().trim_end_matches(':');
+                let label_full = row.cells[0].content.trim();
+                // Strip a single trailing colon (we re-add one); keep extra colons.
+                let label = label_full.strip_suffix(':').unwrap_or(label_full);
                 let value = row.cells[1].content.trim();
                 if plain {
                     out.push_str(label);
@@ -976,13 +1046,43 @@ fn render_table(tc: &TableCollector, plain: bool) -> String {
             }
             HtmlRowKind::Fallback => {
                 flush_grid(&mut grid_run, &mut out);
-                let texts: Vec<&str> = row.cells.iter().map(|c| c.content.as_str()).collect();
-                if plain {
-                    out.push_str(&markdown::build_table_plain(&texts, &[]));
+                if html_row_has_nested_table(row) {
+                    // Emit each cell's text and any nested table as standalone
+                    // blocks, separated by blank lines, so a nested table is never
+                    // escaped into a single grid cell.
+                    for c in &row.cells {
+                        let text = c.content.trim();
+                        if !text.is_empty() {
+                            if plain {
+                                out.push_str(text);
+                                out.push('\n');
+                            } else {
+                                out.push_str(text);
+                                out.push_str("\n\n");
+                            }
+                        }
+                        if c.has_nested_table() {
+                            if plain {
+                                out.push_str(c.nested_plain.trim_end());
+                                out.push('\n');
+                            } else {
+                                out.push_str(c.nested_md.trim_end());
+                                out.push_str("\n\n");
+                            }
+                        }
+                    }
+                    if plain {
+                        out.push('\n');
+                    }
                 } else {
-                    out.push_str(&markdown::build_table(&texts, &[]));
+                    let texts: Vec<&str> = row.cells.iter().map(|c| c.content.as_str()).collect();
+                    if plain {
+                        out.push_str(&markdown::build_table_plain(&texts, &[]));
+                    } else {
+                        out.push_str(&markdown::build_table(&texts, &[]));
+                    }
+                    out.push('\n');
                 }
-                out.push('\n');
             }
         }
     }
@@ -1282,6 +1382,116 @@ mod tests {
                 result.markdown
             );
         }
+        // The inner table renders as a real GFM table, not escaped into a cell.
+        assert!(
+            result.markdown.contains("| inner1 | inner2 |"),
+            "inner table mangled: {}",
+            result.markdown
+        );
+        // No escaped pipes leaking from a crammed nested table.
+        assert!(
+            !result.markdown.contains("\\|"),
+            "escaped pipes leaked: {}",
+            result.markdown
+        );
+        // Plain text must not contain raw GFM pipe rows from the inner table.
+        assert!(
+            !result.plain_text.contains("|---|"),
+            "plain text leaked table syntax: {:?}",
+            result.plain_text
+        );
+    }
+
+    #[test]
+    fn test_html_nested_table_in_simple_outer() {
+        // A nested table inside an otherwise-uniform (no-span) outer table must
+        // still render as a standalone block, not be flattened into one cell.
+        let html = r#"<table><tr><td>a<table><tr><td>x</td><td>y</td></tr></table></td><td>b</td></tr></table>"#;
+        let result = convert_html(html);
+        assert!(
+            result.markdown.contains("| x | y |"),
+            "inner table mangled: {}",
+            result.markdown
+        );
+        assert!(
+            !result.markdown.contains("<br>") && !result.markdown.contains("\\|"),
+            "nested table crammed into a cell: {}",
+            result.markdown
+        );
+        assert!(
+            !result.plain_text.contains('|'),
+            "plain text leaked pipes: {:?}",
+            result.plain_text
+        );
+    }
+
+    #[test]
+    fn test_html_rowspan_colspan_no_empty_label() {
+        // A rowspan placeholder followed by a colspan value must not be rendered as
+        // an empty-label `**:**` line.
+        let html = r#"<table><tr><td rowspan="2">R</td><td>a</td></tr><tr><td colspan="2">wide</td></tr></table>"#;
+        let result = convert_html(html);
+        assert!(
+            !result.markdown.contains("**:**"),
+            "empty-label artifact: {}",
+            result.markdown
+        );
+        assert!(result.markdown.contains("wide"), "md: {}", result.markdown);
+    }
+
+    #[test]
+    fn test_html_label_double_colon_preserved() {
+        let html = r#"<table><tr><td>Ratio::</td><td colspan="2">val</td></tr><tr><td>p</td><td>q</td><td>r</td></tr></table>"#;
+        let result = convert_html(html);
+        assert!(
+            result.markdown.contains("**Ratio::** val"),
+            "colon collapsed: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_html_multi_row_thead_preserved() {
+        // A two-row <thead> must not silently drop the second header row.
+        let html = r#"<table><thead><tr><th>H1a</th><th>H1b</th></tr><tr><th>H2a</th><th>H2b</th></tr></thead><tbody><tr><td>d1</td><td>d2</td></tr></tbody></table>"#;
+        let result = convert_html(html);
+        for needle in ["H1a", "H1b", "H2a", "H2b", "d1", "d2"] {
+            assert!(
+                result.markdown.contains(needle),
+                "header/data dropped: missing {needle}: {}",
+                result.markdown
+            );
+        }
+    }
+
+    #[test]
+    fn test_html_multi_heading_banner_separated() {
+        // Two headings in one banner cell must not mash into "FirstSecond".
+        let html = r#"<table><tr><td colspan="2"><h1>First</h1><h3>Second</h3></td></tr><tr><td>a</td><td>b</td></tr></table>"#;
+        let result = convert_html(html);
+        assert!(
+            !result.markdown.contains("FirstSecond"),
+            "headings mashed: {}",
+            result.markdown
+        );
+        assert!(
+            result.markdown.contains("First Second"),
+            "md: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_html_colspan_bounded_no_dos() {
+        // A huge colspan in a tiling row must not allocate unbounded output.
+        let html = r#"<table><tr><td colspan="1000000">X</td><td>Y</td></tr><tr><td colspan="1000000">P</td><td>Q</td></tr></table>"#;
+        let result = convert_html(html);
+        assert!(
+            result.markdown.len() < 100_000,
+            "output not bounded: {} bytes",
+            result.markdown.len()
+        );
+        assert!(result.markdown.contains('X'));
     }
 
     #[test]

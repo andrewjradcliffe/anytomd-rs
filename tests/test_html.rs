@@ -135,3 +135,40 @@ fn test_html_colspan_layout_hybrid() {
         result.markdown
     );
 }
+
+/// Regression (review finding): a nested table in a simple outer table must
+/// render as a standalone block, not be escaped into one cell; plain text must
+/// not leak GFM pipes.
+#[test]
+fn test_html_nested_table_not_mangled_end_to_end() {
+    let input =
+        br#"<html><body><table><tr><td>a<table><tr><td>x</td><td>y</td></tr></table></td><td>b</td></tr></table></body></html>"#;
+    let result = anytomd::convert_bytes(input, "html", &ConversionOptions::default()).unwrap();
+    assert!(
+        result.markdown.contains("| x | y |"),
+        "md: {}",
+        result.markdown
+    );
+    assert!(
+        !result.markdown.contains("\\|"),
+        "escaped pipes: {}",
+        result.markdown
+    );
+    assert!(
+        !result.plain_text.contains('|'),
+        "plain leaked pipes: {:?}",
+        result.plain_text
+    );
+}
+
+/// Regression (review finding): a huge colspan must not drive unbounded output.
+#[test]
+fn test_html_colspan_dos_bounded_end_to_end() {
+    let input = br#"<html><body><table><tr><td colspan="1000000">X</td><td>Y</td></tr><tr><td colspan="1000000">P</td><td>Q</td></tr></table></body></html>"#;
+    let result = anytomd::convert_bytes(input, "html", &ConversionOptions::default()).unwrap();
+    assert!(
+        result.markdown.len() < 100_000,
+        "not bounded: {} bytes",
+        result.markdown.len()
+    );
+}
