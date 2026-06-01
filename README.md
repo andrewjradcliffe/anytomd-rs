@@ -16,11 +16,11 @@ A pure Rust tool and library that converts various document formats into Markdow
 
 | Format | Extensions | Notes |
 |--------|-----------|-------|
-| DOCX | `.docx` | Headings, tables, lists, bold/italic, hyperlinks, images, text boxes |
-| PPTX | `.pptx` | Slides, tables, speaker notes, images, group shapes |
+| DOCX | `.docx` | Headings, tables (incl. merged/layout tables), lists, bold/italic, hyperlinks, images, text boxes |
+| PPTX | `.pptx` | Slides, tables (incl. merged cells), speaker notes, images, group shapes |
 | XLSX | `.xlsx` | Multi-sheet, date/time handling, images |
 | XLS | `.xls` | Legacy Excel (via calamine) |
-| HTML | `.html`, `.htm` | Full DOM: headings, tables, lists, links, blockquotes, code blocks |
+| HTML | `.html`, `.htm` | Full DOM: headings, tables (incl. `colspan`/`rowspan`), lists, links, blockquotes, code blocks |
 | CSV | `.csv` | Converted to Markdown tables |
 | Jupyter Notebook | `.ipynb` | Markdown cells preserved, code cells in fenced blocks with language detection |
 | JSON | `.json` | Pretty-printed in fenced code blocks |
@@ -116,6 +116,24 @@ Data Overview
 
 > Note: Test multilingual rendering.
 ```
+
+### Tables and merged cells
+
+Plain, uniform tables become pipe-delimited Markdown tables. Tables that use
+merged cells (`gridSpan`/`vMerge` in DOCX, `colspan`/`rowspan` in HTML) — often
+used for page layout rather than tabular data — are rendered with a hybrid
+strategy that preserves all content instead of collapsing columns:
+
+- a full-width row (a single cell spanning every column) becomes a heading when
+  it is heading-styled, otherwise a bold paragraph;
+- a narrow-label + wide-value row becomes `**Label:** value`;
+- genuinely tabular regions (rows whose cells tile the full width) stay
+  pipe-delimited Markdown tables, with horizontal spans empty-filled and
+  vertical-merge continuation cells left blank;
+- nested tables are rendered in place as their own Markdown tables.
+
+PPTX tables are always rendered as Markdown tables; merged cells keep the
+correct column count and the spanning cell's text is not duplicated.
 
 ## Installation
 

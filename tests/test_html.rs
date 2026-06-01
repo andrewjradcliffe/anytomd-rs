@@ -98,3 +98,40 @@ fn test_html_convert_bytes_direct() {
     assert!(result.markdown.contains("# Hello"));
     assert!(result.markdown.contains("World"));
 }
+
+/// Integration test: a colspan/rowspan layout table converts via the hybrid path.
+///
+/// Mirrors the structure of a layout table (full-width banner, label/value rows,
+/// and a data grid) that previously collapsed to a single column. All columns
+/// must survive and the layout rows must linearize.
+#[test]
+fn test_html_colspan_layout_hybrid() {
+    let input = br#"<html><body><table>
+        <tr><td colspan="3"><h2>Section Title</h2></td></tr>
+        <tr><td>Field</td><td colspan="2">Value</td></tr>
+        <tr><td>Col A</td><td>Col B</td><td>Col C</td></tr>
+        <tr><td>1</td><td>2</td><td>3</td></tr>
+    </table></body></html>"#;
+    let result = anytomd::convert_bytes(input, "html", &ConversionOptions::default()).unwrap();
+
+    assert!(
+        result.markdown.contains("## Section Title"),
+        "banner not a heading: {}",
+        result.markdown
+    );
+    assert!(
+        result.markdown.contains("**Field:** Value"),
+        "label/value not linearized: {}",
+        result.markdown
+    );
+    assert!(
+        result.markdown.contains("| Col A | Col B | Col C |"),
+        "grid columns missing: {}",
+        result.markdown
+    );
+    assert!(
+        result.markdown.contains("| 1 | 2 | 3 |"),
+        "grid data missing: {}",
+        result.markdown
+    );
+}

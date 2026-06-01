@@ -358,3 +358,130 @@ fn test_docx_extract_comments_end_to_end() {
     assert!(result.plain_text.contains("source: next Friday"));
     assert!(!result.plain_text.contains("# Comments"));
 }
+
+/// Build a minimal DOCX in memory from a document.xml body and optional styles.
+fn build_docx_from_body(body: &str, styles_xml: Option<&str>) -> Vec<u8> {
+    use std::io::Write;
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let buf = Vec::new();
+    let mut zip = ZipWriter::new(Cursor::new(buf));
+    let opts = SimpleFileOptions::default();
+
+    zip.start_file("[Content_Types].xml", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+    )
+    .unwrap();
+
+    zip.start_file("_rels/.rels", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+    )
+    .unwrap();
+
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>"#
+    );
+    zip.start_file("word/document.xml", opts).unwrap();
+    zip.write_all(document_xml.as_bytes()).unwrap();
+
+    if let Some(styles) = styles_xml {
+        zip.start_file("word/styles.xml", opts).unwrap();
+        zip.write_all(styles.as_bytes()).unwrap();
+    }
+
+    zip.finish().unwrap().into_inner()
+}
+
+/// End-to-end test for a merged/layout table converted via the hybrid path.
+///
+/// The synthetic document mirrors the structure of a layout table that uses
+/// `gridSpan`/`vMerge` for sectioning rather than tabular data: a full-width,
+/// heading-styled banner row; a narrow-label + wide-spanning-value row; and a
+/// two-row data grid with a vertically merged label column, plus an
+/// authoritative `<w:tblGrid>` declaring four columns.
+///
+/// The previous converter collapsed all of this to a single column; the hybrid
+/// renderer must preserve every column and linearize the layout rows.
+#[test]
+fn test_docx_layout_table_hybrid_integration() {
+    let styles = r#"<?xml version="1.0" encoding="UTF-8"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/></w:style></w:styles>"#;
+
+    // 4-column grid. Rows: banner (span4, Heading2), label/value (1 + span3),
+    // data grid header (vMerge restart label + 3 cols), data row (vMerge continue + 3 cols).
+    let body = concat!(
+        r#"<w:tbl>"#,
+        r#"<w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid>"#,
+        // Banner row, heading-styled
+        r#"<w:tr><w:tc><w:tcPr><w:gridSpan w:val="4"/></w:tcPr><w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Section Title</w:t></w:r></w:p></w:tc></w:tr>"#,
+        // Label/value row
+        r#"<w:tr><w:tc><w:p><w:r><w:t>Field</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:gridSpan w:val="3"/></w:tcPr><w:p><w:r><w:t>Value</w:t></w:r></w:p></w:tc></w:tr>"#,
+        // Data grid header: vMerge restart label + 3 data columns
+        r#"<w:tr><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>Info</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Col A</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Col B</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Col C</w:t></w:r></w:p></w:tc></w:tr>"#,
+        // Data row: vMerge continue + 3 values
+        r#"<w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc><w:tc><w:p><w:r><w:t>1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>2</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>3</w:t></w:r></w:p></w:tc></w:tr>"#,
+        r#"</w:tbl>"#,
+    );
+
+    let data = build_docx_from_body(body, Some(styles));
+    let result = anytomd::convert_bytes(&data, "docx", &ConversionOptions::default()).unwrap();
+
+    // Banner row → heading.
+    assert!(
+        result.markdown.contains("## Section Title"),
+        "banner not promoted to heading: {}",
+        result.markdown
+    );
+    // Label/value row → bold label + value.
+    assert!(
+        result.markdown.contains("**Field:** Value"),
+        "label/value not linearized: {}",
+        result.markdown
+    );
+    // Data grid → all columns preserved.
+    assert!(
+        result.markdown.contains("| Info | Col A | Col B | Col C |"),
+        "grid header columns missing: {}",
+        result.markdown
+    );
+    assert!(
+        result.markdown.contains("| 2 | 3 |"),
+        "grid data columns missing: {}",
+        result.markdown
+    );
+    // The vMerge continuation cell is empty in the data row.
+    assert!(
+        result.markdown.contains("|  | 1 | 2 | 3 |"),
+        "vMerge continuation not empty: {}",
+        result.markdown
+    );
+
+    // Plain text linearizes without markdown markers but keeps grid tabs.
+    assert!(result.plain_text.contains("Section Title"));
+    assert!(result.plain_text.contains("Field"));
+    assert!(!result.plain_text.contains("**"));
+    assert!(result.plain_text.contains("Col A\tCol B\tCol C"));
+}
+
+/// Golden test: the merged/layout table renders to a stable, fully-preserved
+/// Markdown layout. Update the expected file with a documented reason if the
+/// hybrid rendering intentionally changes.
+#[test]
+fn test_docx_layout_table_golden() {
+    let styles = r#"<?xml version="1.0" encoding="UTF-8"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/></w:style></w:styles>"#;
+    let body = concat!(
+        r#"<w:tbl>"#,
+        r#"<w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid>"#,
+        r#"<w:tr><w:tc><w:tcPr><w:gridSpan w:val="4"/></w:tcPr><w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Section Title</w:t></w:r></w:p></w:tc></w:tr>"#,
+        r#"<w:tr><w:tc><w:p><w:r><w:t>Field</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:gridSpan w:val="3"/></w:tcPr><w:p><w:r><w:t>Value</w:t></w:r></w:p></w:tc></w:tr>"#,
+        r#"<w:tr><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>Info</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Col A</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Col B</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Col C</w:t></w:r></w:p></w:tc></w:tr>"#,
+        r#"<w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc><w:tc><w:p><w:r><w:t>1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>2</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>3</w:t></w:r></w:p></w:tc></w:tr>"#,
+        r#"</w:tbl>"#,
+    );
+    let data = build_docx_from_body(body, Some(styles));
+    let result = anytomd::convert_bytes(&data, "docx", &ConversionOptions::default()).unwrap();
+    let expected = include_str!("fixtures/expected/layout_table.docx.md");
+    assert_eq!(normalize(&result.markdown), normalize(expected));
+}

@@ -313,6 +313,477 @@ struct SavedParagraphState {
     current_ilvl: Option<u8>,
 }
 
+// ---- Table model ----
+
+/// Vertical-merge state of a table cell (`<w:vMerge>`).
+#[derive(Debug, Clone, Default, PartialEq)]
+enum VMerge {
+    /// Not vertically merged.
+    #[default]
+    None,
+    /// Top cell of a vertical merge (`<w:vMerge w:val="restart"/>`).
+    Restart,
+    /// Continuation cell of a vertical merge (a bare `<w:vMerge/>`).
+    Continue,
+}
+
+/// One paragraph of content buffered inside a table cell.
+///
+/// Cells may contain multiple paragraphs; keeping them as separate blocks lets
+/// the renderer preserve paragraph breaks when linearizing a layout table and
+/// detect heading-styled banner paragraphs. Markdown form retains bold/italic/
+/// link/image syntax; plain form has none.
+#[derive(Debug, Clone)]
+struct DocxCellBlock {
+    /// Markdown form of the paragraph (untrimmed, as produced by the run merge).
+    md: String,
+    /// Plain-text form of the paragraph (untrimmed, no markdown markers).
+    plain: String,
+    /// The paragraph's block kind (used for banner heading detection).
+    kind: ParagraphKind,
+    /// True when this block is a fully-rendered nested table (multi-line GFM).
+    /// Such blocks cannot be collapsed into a single grid cell, so any row that
+    /// contains one is linearized and the table is emitted as a standalone block.
+    is_table: bool,
+}
+
+/// A buffered table cell with horizontal/vertical span info and content blocks.
+#[derive(Debug, Clone)]
+struct DocxCell {
+    /// Grid columns this cell spans (`<w:gridSpan w:val>`); always at least 1.
+    grid_span: usize,
+    /// Vertical-merge state (`<w:vMerge>`).
+    v_merge: VMerge,
+    /// Content paragraphs, in document order.
+    blocks: Vec<DocxCellBlock>,
+}
+
+impl Default for DocxCell {
+    fn default() -> Self {
+        Self {
+            grid_span: 1,
+            v_merge: VMerge::None,
+            blocks: Vec::new(),
+        }
+    }
+}
+
+/// A buffered table row.
+#[derive(Debug, Clone, Default)]
+struct DocxRow {
+    /// Cells in document order.
+    cells: Vec<DocxCell>,
+}
+
+/// A fully buffered table plus its authoritative grid width.
+///
+/// Tables are buffered in full before rendering because layout classification
+/// needs every row in hand. A stack of these supports nested tables: an inner
+/// `<w:tbl>` pushes a new frame and pops on its end tag.
+#[derive(Debug, Clone, Default)]
+struct DocxTable {
+    /// Completed rows, in document order.
+    rows: Vec<DocxRow>,
+    /// Grid column count from `<w:tblGrid>`/`<w:gridCol>` (0 if absent/unparsed).
+    grid_width: usize,
+    /// In-progress row being accumulated.
+    current_row: DocxRow,
+    /// In-progress cell being accumulated.
+    current_cell: DocxCell,
+    /// Number of paragraphs seen so far in the current cell.
+    cell_paragraph_count: usize,
+    /// Whether a `<w:tr>` is currently open in this frame.
+    in_row: bool,
+    /// Whether a `<w:tc>` is currently open in this frame.
+    in_cell: bool,
+}
+
+/// Flatten a cell's paragraph blocks into one Markdown string.
+///
+/// Reproduces the historical join: paragraphs are trimmed and concatenated, with
+/// a single space inserted before each non-empty paragraph after the first; the
+/// whole result is then trimmed.
+fn join_cell_blocks_md(cell: &DocxCell) -> String {
+    let mut s = String::new();
+    for (i, b) in cell.blocks.iter().enumerate() {
+        if i > 0 && !b.md.is_empty() {
+            s.push(' ');
+        }
+        s.push_str(b.md.trim());
+    }
+    s.trim().to_string()
+}
+
+/// Flatten a cell's paragraph blocks into one plain-text string.
+///
+/// Mirrors [`join_cell_blocks_md`] but uses the plain form and checks plain
+/// emptiness for space insertion (matching the historical plain-text join).
+fn join_cell_blocks_plain(cell: &DocxCell) -> String {
+    let mut s = String::new();
+    for (i, b) in cell.blocks.iter().enumerate() {
+        if i > 0 && !b.plain.is_empty() {
+            s.push(' ');
+        }
+        s.push_str(b.plain.trim());
+    }
+    s.trim().to_string()
+}
+
+/// Expand a row's cells across `grid_width` columns for GFM rendering.
+///
+/// A cell with `grid_span = k` places its (joined) text in the first of its `k`
+/// columns and leaves the other `k - 1` empty (empty-fill). Vertical-merge
+/// continuation cells render empty. The `plain` flag selects the plain-text
+/// join. The result always has exactly `grid_width` entries (truncated/padded if
+/// the row's spans do not sum to the width).
+fn expand_row_to_grid(row: &DocxRow, grid_width: usize, plain: bool) -> Vec<String> {
+    let mut cols: Vec<String> = Vec::with_capacity(grid_width);
+    for c in &row.cells {
+        let span = c.grid_span.max(1);
+        let text = if c.v_merge == VMerge::Continue {
+            String::new()
+        } else if plain {
+            join_cell_blocks_plain(c)
+        } else {
+            join_cell_blocks_md(c)
+        };
+        cols.push(text);
+        for _ in 1..span {
+            cols.push(String::new());
+        }
+    }
+    cols.resize(grid_width, String::new());
+    cols
+}
+
+/// Build a GFM table (markdown + plain) from a slice of rows, expanding spans.
+///
+/// The first row supplies the header; remaining rows are data. Each row is
+/// expanded to `grid_width` columns via [`expand_row_to_grid`].
+fn render_docx_grid(rows: &[&DocxRow], grid_width: usize) -> (String, String) {
+    let md_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| expand_row_to_grid(r, grid_width, false))
+        .collect();
+    let plain_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| expand_row_to_grid(r, grid_width, true))
+        .collect();
+
+    let headers: Vec<&str> = md_rows[0].iter().map(|s| s.as_str()).collect();
+    let data: Vec<Vec<&str>> = md_rows[1..]
+        .iter()
+        .map(|r| r.iter().map(|s| s.as_str()).collect())
+        .collect();
+    let md = build_table(&headers, &data);
+
+    let headers_p: Vec<&str> = plain_rows[0].iter().map(|s| s.as_str()).collect();
+    let data_p: Vec<Vec<&str>> = plain_rows[1..]
+        .iter()
+        .map(|r| r.iter().map(|s| s.as_str()).collect())
+        .collect();
+    let plain = build_table_plain(&headers_p, &data_p);
+
+    (md, plain)
+}
+
+/// Render a buffered table to `(markdown, plain_text)`.
+///
+/// Simple tables (uniform widths, no merges) use the historical GFM path
+/// unchanged. Spanned or layout tables are rendered with hybrid linearization:
+/// banner rows become headings/bold paragraphs, label/value rows become
+/// `**Label:** value`, contiguous tiling rows become GFM tables, and irregular
+/// rows become small standalone tables. Plain text linearizes fully (no markers)
+/// for non-grid segments and stays tab-separated for grid segments.
+fn render_docx_table(table: &DocxTable) -> (String, String) {
+    if table.rows.is_empty() {
+        return (String::new(), String::new());
+    }
+
+    let grid_width = docx_grid_width(table);
+    if grid_width == 0 {
+        return (String::new(), String::new());
+    }
+
+    // Simple table: exact historical behavior (row 0 header, flattened cells).
+    if docx_table_is_simple(table) {
+        let row_texts: Vec<Vec<String>> = table
+            .rows
+            .iter()
+            .map(|r| r.cells.iter().map(join_cell_blocks_md).collect())
+            .collect();
+        let row_texts_plain: Vec<Vec<String>> = table
+            .rows
+            .iter()
+            .map(|r| r.cells.iter().map(join_cell_blocks_plain).collect())
+            .collect();
+        let headers: Vec<&str> = row_texts[0].iter().map(|s| s.as_str()).collect();
+        let data: Vec<Vec<&str>> = row_texts[1..]
+            .iter()
+            .map(|r| r.iter().map(|s| s.as_str()).collect())
+            .collect();
+        let md = build_table(&headers, &data);
+        let headers_p: Vec<&str> = row_texts_plain[0].iter().map(|s| s.as_str()).collect();
+        let data_p: Vec<Vec<&str>> = row_texts_plain[1..]
+            .iter()
+            .map(|r| r.iter().map(|s| s.as_str()).collect())
+            .collect();
+        let plain = build_table_plain(&headers_p, &data_p);
+        return (md, plain);
+    }
+
+    // Hybrid path: classify rows and render each segment.
+    let mut md = String::new();
+    let mut plain = String::new();
+    for seg in segment_docx_table(table, grid_width) {
+        match seg {
+            DocxSegment::Banner(row) => {
+                let cell = &row.cells[0];
+                let text = join_cell_blocks_md(cell);
+                if text.is_empty() {
+                    continue;
+                }
+                // Heading if the banner's first paragraph is heading-styled.
+                let level = cell.blocks.first().and_then(|b| match b.kind {
+                    ParagraphKind::Heading(l) => Some(l),
+                    _ => None,
+                });
+                match level {
+                    Some(l) => md.push_str(&format_heading(l, &text)),
+                    None => md.push_str(&format!("**{text}**\n")),
+                }
+                md.push('\n');
+                plain.push_str(&join_cell_blocks_plain(cell));
+                plain.push_str("\n\n");
+            }
+            DocxSegment::LabelValue(row) => {
+                let label = join_cell_blocks_md(&row.cells[0]);
+                let label = label.trim_end_matches(':').to_string();
+                let value_cell = &row.cells[1];
+                // Markdown: bold label + first value paragraph inline, rest on
+                // following lines (paragraph breaks preserved).
+                let value_blocks: Vec<&DocxCellBlock> = value_cell
+                    .blocks
+                    .iter()
+                    .filter(|b| !b.md.trim().is_empty())
+                    .collect();
+                if value_blocks.is_empty() {
+                    md.push_str(&format!("**{label}:**\n\n"));
+                } else {
+                    md.push_str(&format!("**{label}:** {}\n", value_blocks[0].md.trim()));
+                    for b in &value_blocks[1..] {
+                        md.push('\n');
+                        md.push_str(b.md.trim());
+                        md.push('\n');
+                    }
+                    md.push('\n');
+                }
+                // Plain: fully flattened — label line then each value paragraph.
+                let label_plain = join_cell_blocks_plain(&row.cells[0]);
+                let label_plain = label_plain.trim_end_matches(':');
+                plain.push_str(label_plain);
+                plain.push('\n');
+                for b in value_cell
+                    .blocks
+                    .iter()
+                    .filter(|b| !b.plain.trim().is_empty())
+                {
+                    plain.push_str(b.plain.trim());
+                    plain.push('\n');
+                }
+                plain.push('\n');
+            }
+            DocxSegment::Grid(rows) => {
+                let (g_md, g_plain) = render_docx_grid(&rows, grid_width);
+                md.push_str(&g_md);
+                md.push('\n');
+                plain.push_str(&g_plain);
+                plain.push('\n');
+            }
+            DocxSegment::Fallback(row) => {
+                if docx_row_has_nested_table(row) {
+                    // The row carries a nested table: emit each block in place —
+                    // paragraphs as text, the nested table as a standalone block.
+                    for c in &row.cells {
+                        for b in &c.blocks {
+                            if b.md.trim().is_empty() {
+                                continue;
+                            }
+                            md.push_str(b.md.trim_end());
+                            md.push('\n');
+                            if !b.is_table {
+                                md.push('\n');
+                            }
+                            plain.push_str(b.plain.trim_end());
+                            plain.push('\n');
+                        }
+                    }
+                    md.push('\n');
+                    plain.push('\n');
+                } else {
+                    // Small standalone GFM table padded to the row's own cell count.
+                    let texts: Vec<String> = row.cells.iter().map(join_cell_blocks_md).collect();
+                    let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+                    md.push_str(&build_table(&refs, &[]));
+                    md.push('\n');
+                    let texts_p: Vec<String> =
+                        row.cells.iter().map(join_cell_blocks_plain).collect();
+                    let refs_p: Vec<&str> = texts_p.iter().map(|s| s.as_str()).collect();
+                    plain.push_str(&build_table_plain(&refs_p, &[]));
+                    plain.push('\n');
+                }
+            }
+        }
+    }
+
+    (md, plain)
+}
+
+// ---- Table classification ----
+
+/// Authoritative grid width of a table.
+///
+/// Uses the `<w:tblGrid>`/`<w:gridCol>` count when present (decision: tblGrid is
+/// authoritative). Falls back to the maximum over rows of the summed `grid_span`
+/// when the grid is absent or unparsed.
+fn docx_grid_width(t: &DocxTable) -> usize {
+    if t.grid_width > 0 {
+        return t.grid_width;
+    }
+    t.rows
+        .iter()
+        .map(|r| r.cells.iter().map(|c| c.grid_span.max(1)).sum::<usize>())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether a row's cells exactly tile the full grid width.
+///
+/// True when the summed `grid_span` over all cells equals `grid_width`.
+/// Continuation cells of a vertical merge still occupy their columns, so their
+/// `grid_span` is counted like any other cell's.
+fn docx_row_tiles(row: &DocxRow, grid_width: usize) -> bool {
+    grid_width > 0 && row.cells.iter().map(|c| c.grid_span.max(1)).sum::<usize>() == grid_width
+}
+
+/// The layout role of a table row, used to drive hybrid rendering.
+#[derive(Debug, Clone, PartialEq)]
+enum DocxRowKind {
+    /// A single cell spanning the full grid width (e.g. a section header).
+    Banner,
+    /// A narrow label cell followed by a wide value cell spanning the rest.
+    LabelValue,
+    /// Cells that exactly tile the grid width — eligible to stay a GFM table.
+    Tiling,
+    /// Anything else (irregular partial-width rows).
+    Fallback,
+}
+
+/// Whether any cell in the row contains a nested-table block.
+///
+/// Such rows cannot be flattened into single grid cells, so they are linearized
+/// (classified `Fallback`) and their nested tables emitted as standalone blocks.
+fn docx_row_has_nested_table(row: &DocxRow) -> bool {
+    row.cells
+        .iter()
+        .any(|c| c.blocks.iter().any(|b| b.is_table))
+}
+
+/// Classify a single row by its cell layout. First matching rule wins.
+fn classify_docx_row(row: &DocxRow, grid_width: usize) -> DocxRowKind {
+    let cells = &row.cells;
+    // A row whose cell holds a nested table cannot become a grid cell; linearize.
+    if docx_row_has_nested_table(row) {
+        return DocxRowKind::Fallback;
+    }
+    // Banner: one cell covering the whole width.
+    if cells.len() == 1 && grid_width >= 1 && cells[0].grid_span.max(1) >= grid_width {
+        return DocxRowKind::Banner;
+    }
+    // Label/value: narrow label (1 column) + wide value cell that genuinely
+    // spans the remaining columns. The value must span at least 2 columns (so
+    // `grid_width >= 3`); in a 2-column grid a `[1, 1]` row is an ordinary data
+    // row, not a label/value pair.
+    if cells.len() == 2
+        && grid_width >= 3
+        && cells[0].grid_span.max(1) == 1
+        && cells[1].grid_span.max(1) == grid_width - 1
+    {
+        return DocxRowKind::LabelValue;
+    }
+    // Tiling: cells exactly fill the grid width.
+    if docx_row_tiles(row, grid_width) {
+        return DocxRowKind::Tiling;
+    }
+    DocxRowKind::Fallback
+}
+
+/// A contiguous run of rows sharing a layout role, ready to render as one block.
+#[derive(Debug)]
+enum DocxSegment<'a> {
+    /// A banner row → heading (if styled) or bold paragraph.
+    Banner(&'a DocxRow),
+    /// A label/value row → `**Label:** value`.
+    LabelValue(&'a DocxRow),
+    /// A maximal run of consecutive tiling rows → one GFM table (row 0 = header).
+    Grid(Vec<&'a DocxRow>),
+    /// An irregular row → its own small GFM table.
+    Fallback(&'a DocxRow),
+}
+
+/// Segment a table's rows into ordered render units.
+///
+/// Consecutive `Tiling` rows are coalesced into a single `Grid` segment; banner,
+/// label/value, and fallback rows are emitted as singletons in document order.
+/// Iterates an ordered slice only, so output ordering is deterministic.
+fn segment_docx_table<'a>(t: &'a DocxTable, grid_width: usize) -> Vec<DocxSegment<'a>> {
+    let mut segments: Vec<DocxSegment<'a>> = Vec::new();
+    let mut grid_run: Vec<&'a DocxRow> = Vec::new();
+
+    for row in &t.rows {
+        match classify_docx_row(row, grid_width) {
+            DocxRowKind::Tiling => grid_run.push(row),
+            kind => {
+                if !grid_run.is_empty() {
+                    segments.push(DocxSegment::Grid(std::mem::take(&mut grid_run)));
+                }
+                match kind {
+                    DocxRowKind::Banner => segments.push(DocxSegment::Banner(row)),
+                    DocxRowKind::LabelValue => segments.push(DocxSegment::LabelValue(row)),
+                    _ => segments.push(DocxSegment::Fallback(row)),
+                }
+            }
+        }
+    }
+    if !grid_run.is_empty() {
+        segments.push(DocxSegment::Grid(grid_run));
+    }
+    segments
+}
+
+/// Whether a table is "simple" and should use the plain GFM path unchanged.
+///
+/// True when no cell carries a horizontal or vertical merge and every row has the
+/// same cell count. Such tables render exactly as they did before hybrid handling,
+/// guaranteeing zero regression for ordinary data tables.
+fn docx_table_is_simple(t: &DocxTable) -> bool {
+    if t.rows.is_empty() {
+        return true;
+    }
+    // A nested table inside any cell forces the hybrid path so the inner table
+    // can be emitted as a standalone block rather than flattened into a cell.
+    if t.rows.iter().any(docx_row_has_nested_table) {
+        return false;
+    }
+    let width = t.rows[0].cells.len();
+    t.rows.iter().all(|r| {
+        r.cells.len() == width
+            && r.cells
+                .iter()
+                .all(|c| c.grid_span <= 1 && c.v_merge == VMerge::None)
+    })
+}
+
 /// Merge adjacent segments with the same formatting, then apply `wrap_formatting`
 /// once per merged group.
 fn merge_and_format_runs(runs: &[RunSegment]) -> String {
@@ -408,18 +879,9 @@ fn parse_document(
     // Track if last paragraph was a list item (for single-newline separation)
     let mut last_was_list = false;
 
-    // Table state
-    let mut in_table = false;
-    let mut in_table_row = false;
-    let mut in_table_cell = false;
-    let mut table_rows: Vec<Vec<String>> = Vec::new();
-    let mut current_row: Vec<String> = Vec::new();
-    let mut current_cell_text = String::new();
-    let mut cell_paragraph_count: usize = 0;
-    // Plain-text table state (no markdown formatting in cells)
-    let mut table_rows_plain: Vec<Vec<String>> = Vec::new();
-    let mut current_row_plain: Vec<String> = Vec::new();
-    let mut current_cell_text_plain = String::new();
+    // Table state: a stack of buffered tables supports nesting. The top frame
+    // is the table currently being parsed; an inner `<w:tbl>` pushes a new frame.
+    let mut table_stack: Vec<DocxTable> = Vec::new();
 
     // Drawing/Image state
     let mut in_drawing = false;
@@ -526,20 +988,19 @@ fn parse_document(
                         in_body = true;
                     }
                     "tbl" if in_body => {
-                        in_table = true;
-                        table_rows.clear();
-                        table_rows_plain.clear();
+                        // Push a new table frame (supports nested tables).
+                        table_stack.push(DocxTable::default());
                     }
-                    "tr" if in_table => {
-                        in_table_row = true;
-                        current_row.clear();
-                        current_row_plain.clear();
+                    "tr" if !table_stack.is_empty() => {
+                        let frame = table_stack.last_mut().unwrap();
+                        frame.in_row = true;
+                        frame.current_row = DocxRow::default();
                     }
-                    "tc" if in_table_row => {
-                        in_table_cell = true;
-                        current_cell_text.clear();
-                        current_cell_text_plain.clear();
-                        cell_paragraph_count = 0;
+                    "tc" if table_stack.last().is_some_and(|f| f.in_row) => {
+                        let frame = table_stack.last_mut().unwrap();
+                        frame.in_cell = true;
+                        frame.current_cell = DocxCell::default();
+                        frame.cell_paragraph_count = 0;
                     }
                     "p" if in_body => {
                         in_paragraph = true;
@@ -661,6 +1122,26 @@ fn parse_document(
                 let local_str = std::str::from_utf8(local.as_ref()).unwrap_or("");
 
                 match local_str {
+                    // `<w:gridCol>` inside `<w:tblGrid>` defines one grid column;
+                    // counting them yields the authoritative table width.
+                    "gridCol" if table_stack.last().is_some_and(|f| !f.in_row) => {
+                        table_stack.last_mut().unwrap().grid_width += 1;
+                    }
+                    // `<w:gridSpan w:val="N"/>` in `<w:tcPr>`: horizontal merge.
+                    "gridSpan" if table_stack.last().is_some_and(|f| f.in_cell) => {
+                        if let Some(n) = read_w_val(e).and_then(|v| v.parse::<usize>().ok()) {
+                            table_stack.last_mut().unwrap().current_cell.grid_span = n.max(1);
+                        }
+                    }
+                    // `<w:vMerge .../>` in `<w:tcPr>`: vertical merge. `w:val="restart"`
+                    // starts a merge; a bare `<w:vMerge/>` (or any other value) continues one.
+                    "vMerge" if table_stack.last().is_some_and(|f| f.in_cell) => {
+                        let v = match read_w_val(e).as_deref() {
+                            Some("restart") => VMerge::Restart,
+                            _ => VMerge::Continue,
+                        };
+                        table_stack.last_mut().unwrap().current_cell.v_merge = v;
+                    }
                     "pStyle" if in_para_properties => {
                         for attr in e.attributes().flatten() {
                             let local_name = attr.key.local_name();
@@ -824,48 +1305,42 @@ fn parse_document(
                     "body" => {
                         in_body = false;
                     }
-                    "tbl" if in_table => {
-                        // Render table
-                        if !table_rows.is_empty() {
-                            let first_row = &table_rows[0];
-                            let headers: Vec<&str> = first_row.iter().map(|s| s.as_str()).collect();
-                            let data_rows: Vec<Vec<&str>> = table_rows[1..]
-                                .iter()
-                                .map(|row| row.iter().map(|s| s.as_str()).collect())
-                                .collect();
-                            let table_md = build_table(&headers, &data_rows);
+                    "tbl" if !table_stack.is_empty() => {
+                        let table = table_stack.pop().unwrap();
+                        let (table_md, table_plain) = render_docx_table(&table);
+                        if table_stack.last().is_some_and(|f| f.in_cell) {
+                            // Nested table: attach its rendered output to the
+                            // enclosing cell as a block so it renders in place.
+                            if !table_md.is_empty() {
+                                table_stack.last_mut().unwrap().current_cell.blocks.push(
+                                    DocxCellBlock {
+                                        md: table_md,
+                                        plain: table_plain,
+                                        kind: ParagraphKind::Normal,
+                                        is_table: true,
+                                    },
+                                );
+                            }
+                        } else if !table_md.is_empty() {
+                            // Outermost table: write to the document output.
                             output.push_str(&table_md);
                             output.push('\n');
-                            // Use plain-text rows (no markdown formatting) for plain output
-                            let first_row_plain = &table_rows_plain[0];
-                            let headers_plain: Vec<&str> =
-                                first_row_plain.iter().map(|s| s.as_str()).collect();
-                            let data_rows_plain: Vec<Vec<&str>> = table_rows_plain[1..]
-                                .iter()
-                                .map(|row| row.iter().map(|s| s.as_str()).collect())
-                                .collect();
-                            let table_plain = build_table_plain(&headers_plain, &data_rows_plain);
                             plain_output.push_str(&table_plain);
                             plain_output.push('\n');
                         }
-                        in_table = false;
-                        table_rows.clear();
-                        table_rows_plain.clear();
                         last_was_list = false;
                     }
-                    "tr" if in_table_row => {
-                        table_rows.push(current_row.clone());
-                        current_row.clear();
-                        table_rows_plain.push(current_row_plain.clone());
-                        current_row_plain.clear();
-                        in_table_row = false;
+                    "tr" if table_stack.last().is_some_and(|f| f.in_row) => {
+                        let frame = table_stack.last_mut().unwrap();
+                        let row = std::mem::take(&mut frame.current_row);
+                        frame.rows.push(row);
+                        frame.in_row = false;
                     }
-                    "tc" if in_table_cell => {
-                        current_row.push(current_cell_text.trim().to_string());
-                        current_cell_text.clear();
-                        current_row_plain.push(current_cell_text_plain.trim().to_string());
-                        current_cell_text_plain.clear();
-                        in_table_cell = false;
+                    "tc" if table_stack.last().is_some_and(|f| f.in_cell) => {
+                        let frame = table_stack.last_mut().unwrap();
+                        let cell = std::mem::take(&mut frame.current_cell);
+                        frame.current_row.cells.push(cell);
+                        frame.in_cell = false;
                     }
                     "p" if in_paragraph => {
                         // Resolve list item kind from numPr
@@ -884,17 +1359,16 @@ fn parse_document(
                         // Plain text: no bold/italic markers, no link/image syntax
                         let current_para_text_plain = merge_runs_plain(&current_para_runs_plain);
 
-                        if in_table_cell {
-                            // In a table cell: accumulate text
-                            if cell_paragraph_count > 0 && !current_para_text.is_empty() {
-                                current_cell_text.push(' ');
-                            }
-                            current_cell_text.push_str(current_para_text.trim());
-                            if cell_paragraph_count > 0 && !current_para_text_plain.is_empty() {
-                                current_cell_text_plain.push(' ');
-                            }
-                            current_cell_text_plain.push_str(current_para_text_plain.trim());
-                            cell_paragraph_count += 1;
+                        if table_stack.last().is_some_and(|f| f.in_cell) {
+                            // In a table cell: buffer this paragraph as a content block.
+                            let frame = table_stack.last_mut().unwrap();
+                            frame.current_cell.blocks.push(DocxCellBlock {
+                                md: current_para_text.clone(),
+                                plain: current_para_text_plain.clone(),
+                                kind: current_para_kind.clone(),
+                                is_table: false,
+                            });
+                            frame.cell_paragraph_count += 1;
                         } else {
                             // Normal paragraph finalization
                             let is_list =
@@ -1039,6 +1513,18 @@ fn parse_document(
     };
 
     (markdown, plain_text, title, warnings, image_infos)
+}
+
+/// Read the `w:val` attribute of an element, if present (namespace-agnostic).
+fn read_w_val(e: &quick_xml::events::BytesStart) -> Option<String> {
+    for attr in e.attributes().flatten() {
+        let local_name = attr.key.local_name();
+        let k = std::str::from_utf8(local_name.as_ref()).unwrap_or("");
+        if k == "val" {
+            return Some(String::from_utf8_lossy(&attr.value).to_string());
+        }
+    }
+    None
 }
 
 /// Check if a `w:val` attribute on an element is explicitly false ("0" or "false").
@@ -2380,11 +2866,10 @@ mod tests {
     }
 
     #[test]
-    fn test_docx_table_merged_cells_no_panic() {
-        // Table with gridSpan (horizontal merge) — converter doesn't handle merging
-        // but should not panic. The first row has 1 cell with gridSpan=2, so
-        // build_table treats it as a 1-column table (header dictates column count).
-        // Row 2's second cell "B" gets truncated — that's expected current behavior.
+    fn test_docx_table_gridspan_banner_preserves_all_columns() {
+        // A full-width gridSpan banner over a two-column data row. The banner must
+        // not collapse the table to one column: both "A" and "B" must survive.
+        // (This previously truncated every row to its first cell.)
         let body = r#"<w:tbl><w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>Merged</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
         let doc = wrap_body(body);
         let data = build_test_docx(&doc, None, None);
@@ -2392,9 +2877,503 @@ mod tests {
         let result = converter
             .convert(&data, &ConversionOptions::default())
             .unwrap();
-        // No panic, and at least the merged header + first cell are preserved
-        assert!(result.markdown.contains("Merged"));
-        assert!(result.markdown.contains("A"));
+        // The banner row linearizes to a bold paragraph (not a one-column table).
+        assert!(
+            result.markdown.contains("**Merged**"),
+            "banner missing: {}",
+            result.markdown
+        );
+        // The data row keeps both columns.
+        assert!(
+            result.markdown.contains("| A | B |"),
+            "columns truncated: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_docx_table_depth_stack_nested_smoke() {
+        // A table nested inside a cell of an outer table. The parser tracks table
+        // depth via a stack, so both the outer cell text and the inner table's
+        // cells must survive (the old single-flag machine could not nest).
+        let body = r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>outer</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>inner</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:tc></w:tr></w:tbl>"#;
+        let doc = wrap_body(body);
+        let data = build_test_docx(&doc, None, None);
+        let converter = DocxConverter;
+        let result = converter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        assert!(
+            result.markdown.contains("outer"),
+            "outer cell text missing: {}",
+            result.markdown
+        );
+        assert!(
+            result.markdown.contains("inner"),
+            "inner table text missing: {}",
+            result.markdown
+        );
+    }
+
+    // ---- Table classifier unit tests ----
+
+    /// Build a cell with the given markdown text, grid span, and merge state.
+    fn cell(text: &str, grid_span: usize, v_merge: VMerge) -> DocxCell {
+        DocxCell {
+            grid_span,
+            v_merge,
+            blocks: vec![DocxCellBlock {
+                md: text.to_string(),
+                plain: text.to_string(),
+                kind: ParagraphKind::Normal,
+                is_table: false,
+            }],
+        }
+    }
+
+    /// Build a row from cells.
+    fn row(cells: Vec<DocxCell>) -> DocxRow {
+        DocxRow { cells }
+    }
+
+    #[test]
+    fn test_docx_grid_width_from_gridcol() {
+        let t = DocxTable {
+            grid_width: 3,
+            rows: vec![row(vec![cell("a", 1, VMerge::None)])],
+            ..Default::default()
+        };
+        assert_eq!(docx_grid_width(&t), 3);
+    }
+
+    #[test]
+    fn test_docx_grid_width_fallback_max_span() {
+        let t = DocxTable {
+            grid_width: 0,
+            rows: vec![
+                row(vec![cell("a", 2, VMerge::None)]),
+                row(vec![
+                    cell("a", 1, VMerge::None),
+                    cell("b", 1, VMerge::None),
+                    cell("c", 1, VMerge::None),
+                ]),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(docx_grid_width(&t), 3);
+    }
+
+    #[test]
+    fn test_docx_row_tiles_exact() {
+        let r = row(vec![
+            cell("a", 1, VMerge::None),
+            cell("b", 1, VMerge::None),
+            cell("c", 1, VMerge::None),
+        ]);
+        assert!(docx_row_tiles(&r, 3));
+    }
+
+    #[test]
+    fn test_docx_row_tiles_banner_full_width() {
+        // A single full-width cell technically tiles; banner classification (which
+        // is checked before tiling) is what distinguishes it.
+        let r = row(vec![cell("a", 3, VMerge::None)]);
+        assert!(docx_row_tiles(&r, 3));
+    }
+
+    #[test]
+    fn test_docx_row_tiles_short_false() {
+        let r = row(vec![cell("a", 1, VMerge::None), cell("b", 1, VMerge::None)]);
+        assert!(!docx_row_tiles(&r, 3));
+    }
+
+    #[test]
+    fn test_classify_docx_row_banner() {
+        let r = row(vec![cell("Section", 5, VMerge::None)]);
+        assert_eq!(classify_docx_row(&r, 5), DocxRowKind::Banner);
+    }
+
+    #[test]
+    fn test_classify_docx_row_label_value() {
+        let r = row(vec![
+            cell("Label", 1, VMerge::None),
+            cell("Value", 4, VMerge::None),
+        ]);
+        assert_eq!(classify_docx_row(&r, 5), DocxRowKind::LabelValue);
+    }
+
+    #[test]
+    fn test_classify_docx_row_tiling() {
+        let r = row(vec![
+            cell("a", 1, VMerge::None),
+            cell("b", 1, VMerge::None),
+            cell("c", 1, VMerge::None),
+        ]);
+        assert_eq!(classify_docx_row(&r, 3), DocxRowKind::Tiling);
+    }
+
+    #[test]
+    fn test_classify_docx_row_fallback() {
+        // Two narrow cells in a 5-column grid: neither banner, label/value, nor tiling.
+        let r = row(vec![cell("a", 1, VMerge::None), cell("b", 1, VMerge::None)]);
+        assert_eq!(classify_docx_row(&r, 5), DocxRowKind::Fallback);
+    }
+
+    #[test]
+    fn test_segment_docx_banner_then_grid() {
+        let t = DocxTable {
+            grid_width: 3,
+            rows: vec![
+                row(vec![cell("Banner", 3, VMerge::None)]),
+                row(vec![
+                    cell("a", 1, VMerge::None),
+                    cell("b", 1, VMerge::None),
+                    cell("c", 1, VMerge::None),
+                ]),
+                row(vec![
+                    cell("d", 1, VMerge::None),
+                    cell("e", 1, VMerge::None),
+                    cell("f", 1, VMerge::None),
+                ]),
+            ],
+            ..Default::default()
+        };
+        let segs = segment_docx_table(&t, 3);
+        assert_eq!(segs.len(), 2);
+        assert!(matches!(segs[0], DocxSegment::Banner(_)));
+        match &segs[1] {
+            DocxSegment::Grid(rows) => assert_eq!(rows.len(), 2),
+            other => panic!("expected Grid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_segment_docx_grid_split_by_labelvalue() {
+        let t = DocxTable {
+            grid_width: 3,
+            rows: vec![
+                row(vec![
+                    cell("a", 1, VMerge::None),
+                    cell("b", 1, VMerge::None),
+                    cell("c", 1, VMerge::None),
+                ]),
+                row(vec![cell("L", 1, VMerge::None), cell("V", 2, VMerge::None)]),
+                row(vec![
+                    cell("d", 1, VMerge::None),
+                    cell("e", 1, VMerge::None),
+                    cell("f", 1, VMerge::None),
+                ]),
+            ],
+            ..Default::default()
+        };
+        let segs = segment_docx_table(&t, 3);
+        assert_eq!(segs.len(), 3);
+        assert!(matches!(segs[0], DocxSegment::Grid(_)));
+        assert!(matches!(segs[1], DocxSegment::LabelValue(_)));
+        assert!(matches!(segs[2], DocxSegment::Grid(_)));
+    }
+
+    #[test]
+    fn test_docx_table_is_simple_true() {
+        let t = DocxTable {
+            grid_width: 2,
+            rows: vec![
+                row(vec![cell("a", 1, VMerge::None), cell("b", 1, VMerge::None)]),
+                row(vec![cell("c", 1, VMerge::None), cell("d", 1, VMerge::None)]),
+            ],
+            ..Default::default()
+        };
+        assert!(docx_table_is_simple(&t));
+    }
+
+    #[test]
+    fn test_docx_table_is_simple_false_gridspan() {
+        let t = DocxTable {
+            grid_width: 2,
+            rows: vec![row(vec![cell("a", 2, VMerge::None)])],
+            ..Default::default()
+        };
+        assert!(!docx_table_is_simple(&t));
+    }
+
+    #[test]
+    fn test_docx_table_is_simple_false_vmerge() {
+        let t = DocxTable {
+            grid_width: 1,
+            rows: vec![row(vec![cell("a", 1, VMerge::Restart)])],
+            ..Default::default()
+        };
+        assert!(!docx_table_is_simple(&t));
+    }
+
+    #[test]
+    fn test_docx_table_is_simple_false_ragged() {
+        let t = DocxTable {
+            grid_width: 2,
+            rows: vec![
+                row(vec![cell("a", 1, VMerge::None), cell("b", 1, VMerge::None)]),
+                row(vec![cell("c", 1, VMerge::None)]),
+            ],
+            ..Default::default()
+        };
+        assert!(!docx_table_is_simple(&t));
+    }
+
+    // ---- Hybrid render unit tests ----
+
+    /// Build a cell whose first paragraph carries the given kind (for banner tests).
+    fn cell_kind(text: &str, grid_span: usize, kind: ParagraphKind) -> DocxCell {
+        DocxCell {
+            grid_span,
+            v_merge: VMerge::None,
+            blocks: vec![DocxCellBlock {
+                md: text.to_string(),
+                plain: text.to_string(),
+                kind,
+                is_table: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_docx_expand_row_to_grid_hspan() {
+        let r = row(vec![cell("X", 2, VMerge::None), cell("Y", 1, VMerge::None)]);
+        assert_eq!(expand_row_to_grid(&r, 3, false), vec!["X", "", "Y"]);
+    }
+
+    #[test]
+    fn test_docx_expand_row_vmerge_continue_empty() {
+        let r = row(vec![cell("kept", 1, VMerge::Continue)]);
+        assert_eq!(expand_row_to_grid(&r, 1, false), vec![""]);
+    }
+
+    #[test]
+    fn test_docx_render_banner_bold() {
+        // Banner with a Normal paragraph → bold paragraph, not a heading.
+        let t = DocxTable {
+            grid_width: 3,
+            rows: vec![row(vec![cell("Section Header", 3, VMerge::None)])],
+            ..Default::default()
+        };
+        let (md, _plain) = render_docx_table(&t);
+        assert!(md.contains("**Section Header**"), "md: {md}");
+        assert!(!md.contains("# Section Header"), "md: {md}");
+        assert!(!md.contains('|'), "banner must not be a table: {md}");
+    }
+
+    #[test]
+    fn test_docx_render_banner_heading() {
+        let t = DocxTable {
+            grid_width: 3,
+            rows: vec![row(vec![cell_kind(
+                "Section Header",
+                3,
+                ParagraphKind::Heading(2),
+            )])],
+            ..Default::default()
+        };
+        let (md, _plain) = render_docx_table(&t);
+        assert!(md.contains("## Section Header"), "md: {md}");
+    }
+
+    #[test]
+    fn test_docx_render_label_value() {
+        let t = DocxTable {
+            grid_width: 3,
+            rows: vec![row(vec![
+                cell("Date", 1, VMerge::None),
+                cell("Monday", 2, VMerge::None),
+            ])],
+            ..Default::default()
+        };
+        let (md, _plain) = render_docx_table(&t);
+        assert!(md.contains("**Date:** Monday"), "md: {md}");
+    }
+
+    #[test]
+    fn test_docx_render_label_value_existing_colon_not_doubled() {
+        let t = DocxTable {
+            grid_width: 3,
+            rows: vec![row(vec![
+                cell("Date:", 1, VMerge::None),
+                cell("Monday", 2, VMerge::None),
+            ])],
+            ..Default::default()
+        };
+        let (md, _plain) = render_docx_table(&t);
+        assert!(md.contains("**Date:** Monday"), "md: {md}");
+        assert!(!md.contains("Date::"), "colon doubled: {md}");
+    }
+
+    #[test]
+    fn test_docx_render_grid_region_full_width() {
+        // A banner over a 3-column data grid: the grid keeps all columns.
+        let t = DocxTable {
+            grid_width: 3,
+            rows: vec![
+                row(vec![cell("Banner", 3, VMerge::None)]),
+                row(vec![
+                    cell("A", 1, VMerge::None),
+                    cell("B", 1, VMerge::None),
+                    cell("C", 1, VMerge::None),
+                ]),
+                row(vec![
+                    cell("1", 1, VMerge::None),
+                    cell("2", 1, VMerge::None),
+                    cell("3", 1, VMerge::None),
+                ]),
+            ],
+            ..Default::default()
+        };
+        let (md, _plain) = render_docx_table(&t);
+        assert!(md.contains("| A | B | C |"), "md: {md}");
+        assert!(md.contains("| 1 | 2 | 3 |"), "md: {md}");
+    }
+
+    #[test]
+    fn test_docx_render_grid_vmerge_continue_blank() {
+        // vMerge restart label + continuation: continuation cell renders empty.
+        let t = DocxTable {
+            grid_width: 2,
+            rows: vec![
+                row(vec![
+                    cell("Label", 1, VMerge::Restart),
+                    cell("Head", 1, VMerge::None),
+                ]),
+                row(vec![
+                    cell("", 1, VMerge::Continue),
+                    cell("Val", 1, VMerge::None),
+                ]),
+            ],
+            ..Default::default()
+        };
+        let (md, _plain) = render_docx_table(&t);
+        assert!(md.contains("| Label | Head |"), "md: {md}");
+        // The continuation cell is empty in the data row.
+        assert!(md.contains("|  | Val |"), "md: {md}");
+    }
+
+    #[test]
+    fn test_docx_render_pipe_in_cell_escaped() {
+        // A literal pipe inside a hybrid-grid cell must be escaped by build_table.
+        let t = DocxTable {
+            grid_width: 2,
+            rows: vec![
+                row(vec![cell("Banner", 2, VMerge::None)]),
+                row(vec![
+                    cell("a|b", 1, VMerge::None),
+                    cell("c", 1, VMerge::None),
+                ]),
+            ],
+            ..Default::default()
+        };
+        let (md, _plain) = render_docx_table(&t);
+        assert!(md.contains("a\\|b"), "pipe not escaped: {md}");
+    }
+
+    #[test]
+    fn test_docx_plain_linearized_flattened() {
+        // Plain text: banner + label/value linearize with NO markers; grid region
+        // stays tab-separated.
+        let t = DocxTable {
+            grid_width: 3,
+            rows: vec![
+                row(vec![cell("Section", 3, VMerge::None)]),
+                row(vec![
+                    cell("Field", 1, VMerge::None),
+                    cell("Value", 2, VMerge::None),
+                ]),
+                row(vec![
+                    cell("A", 1, VMerge::None),
+                    cell("B", 1, VMerge::None),
+                    cell("C", 1, VMerge::None),
+                ]),
+            ],
+            ..Default::default()
+        };
+        let (_md, plain) = render_docx_table(&t);
+        assert!(plain.contains("Section"), "plain: {plain}");
+        assert!(plain.contains("Field"), "plain: {plain}");
+        assert!(plain.contains("Value"), "plain: {plain}");
+        // No markdown markers in linearized plain text.
+        assert!(!plain.contains("**"), "plain has bold markers: {plain}");
+        assert!(!plain.contains("**Field:**"), "plain: {plain}");
+        // Grid region is tab-separated.
+        assert!(plain.contains("A\tB\tC"), "plain grid not tabbed: {plain}");
+    }
+
+    #[test]
+    fn test_docx_render_deterministic() {
+        // Byte-stable output: two renders of the same table must be identical.
+        let t = DocxTable {
+            grid_width: 3,
+            rows: vec![
+                row(vec![cell("Banner", 3, VMerge::None)]),
+                row(vec![
+                    cell("Field", 1, VMerge::None),
+                    cell("Value", 2, VMerge::None),
+                ]),
+                row(vec![
+                    cell("A", 1, VMerge::None),
+                    cell("B", 1, VMerge::None),
+                    cell("C", 1, VMerge::None),
+                ]),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(render_docx_table(&t), render_docx_table(&t));
+    }
+
+    #[test]
+    fn test_docx_nested_table_rendered_fully() {
+        // A 2x2 inner table inside a single outer cell. All four inner cells must
+        // appear, rendered as a GFM table nested within the outer cell's position.
+        let inner = r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>i1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>i2</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t>i3</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>i4</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+        let body = format!(
+            r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>outer-text</w:t></w:r></w:p>{inner}</w:tc></w:tr></w:tbl>"#
+        );
+        let doc = wrap_body(&body);
+        let data = build_test_docx(&doc, None, None);
+        let result = DocxConverter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        for needle in ["outer-text", "i1", "i2", "i3", "i4"] {
+            assert!(
+                result.markdown.contains(needle),
+                "missing {needle}: {}",
+                result.markdown
+            );
+        }
+        // The inner table is rendered as a GFM table (has a separator row).
+        assert!(
+            result.markdown.contains("| i1 | i2 |"),
+            "{}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_docx_nested_table_forces_linearize() {
+        // The outer row holds a nested table, so it must linearize: the outer
+        // cell text is not crammed into a one-column GFM cell with <br> noise.
+        let inner =
+            r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>inner</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+        let body = format!(
+            r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>before</w:t></w:r></w:p>{inner}</w:tc></w:tr></w:tbl>"#
+        );
+        let doc = wrap_body(&body);
+        let data = build_test_docx(&doc, None, None);
+        let result = DocxConverter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        assert!(result.markdown.contains("before"), "{}", result.markdown);
+        assert!(result.markdown.contains("inner"), "{}", result.markdown);
+        // No <br>-joined cramming of the outer paragraph with the inner table.
+        assert!(
+            !result.markdown.contains("before<br>"),
+            "outer cell was crammed: {}",
+            result.markdown
+        );
     }
 
     // ---- List tests ----

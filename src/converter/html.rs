@@ -75,7 +75,9 @@ struct WalkerState {
     plain_trailing_newlines: usize,
     pending_heading: Option<PendingHeading>,
     pending_link: Option<PendingLink>,
-    table_collector: Option<TableCollector>,
+    /// Stack of table collectors; the top is the table currently being walked.
+    /// A nested `<table>` inside a cell pushes a new frame.
+    table_stack: Vec<TableCollector>,
 }
 
 struct ListContext {
@@ -94,12 +96,41 @@ struct PendingLink {
     start_pos: usize,
 }
 
+/// One buffered HTML table cell with span info and content.
+#[derive(Debug, Clone, Default)]
+struct HtmlCell {
+    /// Columns this cell spans (`colspan`), always at least 1.
+    colspan: usize,
+    /// Rows this cell spans (`rowspan`), always at least 1.
+    rowspan: usize,
+    /// True when the cell contains a heading element (`<h1>`..`<h6>`).
+    has_heading: bool,
+    /// Heading level of the first contained heading, if any (for banner promotion).
+    heading_level: u8,
+    /// Accumulated cell text.
+    content: String,
+}
+
+/// One buffered HTML table row.
+#[derive(Debug, Clone, Default)]
+struct HtmlRow {
+    /// Cells in document order.
+    cells: Vec<HtmlCell>,
+    /// True if this row came from `<thead>`.
+    is_header_row: bool,
+}
+
+/// Buffers an HTML table while its elements are walked.
 struct TableCollector {
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
-    current_row: Vec<String>,
-    current_cell: String,
+    /// Completed rows, in document order.
+    rows: Vec<HtmlRow>,
+    /// In-progress row.
+    current_row: HtmlRow,
+    /// In-progress cell.
+    current_cell: HtmlCell,
+    /// Whether the current row is inside `<thead>`.
     in_header: bool,
+    /// Whether a `<th>`/`<td>` is currently open.
     in_cell: bool,
 }
 
@@ -116,7 +147,7 @@ impl WalkerState {
             plain_trailing_newlines: 0,
             pending_heading: None,
             pending_link: None,
-            table_collector: None,
+            table_stack: Vec::new(),
         }
     }
 
@@ -220,7 +251,7 @@ impl WalkerState {
     }
 
     fn in_table_cell(&self) -> bool {
-        self.table_collector.as_ref().is_some_and(|tc| tc.in_cell)
+        self.table_stack.last().is_some_and(|tc| tc.in_cell)
     }
 }
 
@@ -263,13 +294,25 @@ fn handle_open(state: &mut WalkerState, node: &ego_tree::NodeRef<Node>) {
                 }
                 _ if state.skip_depth > 0 => {}
                 "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                    state.both_ensure_blank_line();
                     let level = tag[1..].parse::<u8>().unwrap_or(1);
-                    state.pending_heading = Some(PendingHeading {
-                        level,
-                        start_pos: state.output.len(),
-                        plain_start_pos: state.plain_output.len(),
-                    });
+                    // A heading inside a table cell is recorded on the cell so a
+                    // banner row can be promoted to that heading level; the cell's
+                    // text is still accumulated normally (no heading markers).
+                    if let Some(tc) = state.table_stack.last_mut()
+                        && tc.in_cell
+                        && !tc.current_cell.has_heading
+                    {
+                        tc.current_cell.has_heading = true;
+                        tc.current_cell.heading_level = level;
+                    }
+                    if !state.in_table_cell() {
+                        state.both_ensure_blank_line();
+                        state.pending_heading = Some(PendingHeading {
+                            level,
+                            start_pos: state.output.len(),
+                            plain_start_pos: state.plain_output.len(),
+                        });
+                    }
                 }
                 "p" if !state.in_table_cell() => {
                     state.both_ensure_blank_line();
@@ -346,33 +389,50 @@ fn handle_open(state: &mut WalkerState, node: &ego_tree::NodeRef<Node>) {
                 }
                 "table" => {
                     state.both_ensure_blank_line();
-                    state.table_collector = Some(TableCollector {
-                        headers: Vec::new(),
+                    // Push a new table frame (supports nested tables).
+                    state.table_stack.push(TableCollector {
                         rows: Vec::new(),
-                        current_row: Vec::new(),
-                        current_cell: String::new(),
+                        current_row: HtmlRow::default(),
+                        current_cell: HtmlCell::default(),
                         in_header: false,
                         in_cell: false,
                     });
                 }
                 "thead" => {
-                    if let Some(tc) = &mut state.table_collector {
+                    if let Some(tc) = state.table_stack.last_mut() {
                         tc.in_header = true;
                     }
                 }
                 "tbody" => {
-                    if let Some(tc) = &mut state.table_collector {
+                    if let Some(tc) = state.table_stack.last_mut() {
                         tc.in_header = false;
                     }
                 }
                 "tr" => {
-                    if let Some(tc) = &mut state.table_collector {
-                        tc.current_row = Vec::new();
+                    if let Some(tc) = state.table_stack.last_mut() {
+                        tc.current_row = HtmlRow::default();
+                        tc.current_row.is_header_row = tc.in_header;
                     }
                 }
                 "th" | "td" => {
-                    if let Some(tc) = &mut state.table_collector {
-                        tc.current_cell = String::new();
+                    let colspan = el
+                        .attr("colspan")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .max(1);
+                    let rowspan = el
+                        .attr("rowspan")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .max(1);
+                    if let Some(tc) = state.table_stack.last_mut() {
+                        tc.current_cell = HtmlCell {
+                            colspan,
+                            rowspan,
+                            has_heading: false,
+                            heading_level: 0,
+                            content: String::new(),
+                        };
                         tc.in_cell = true;
                     }
                 }
@@ -511,30 +571,41 @@ fn handle_close(state: &mut WalkerState, node: &ego_tree::NodeRef<Node>) {
                 state.both_ensure_newline();
             }
             "table" => {
-                if let Some(tc) = state.table_collector.take() {
+                if let Some(tc) = state.table_stack.pop() {
                     let table_md = render_table(&tc, false);
-                    state.push_str(&table_md);
                     let table_plain = render_table(&tc, true);
-                    state.plain_push_str(&table_plain);
-                }
-            }
-            "thead" => {
-                // in_header handled by tbody open or next row
-            }
-            "tr" => {
-                if let Some(tc) = &mut state.table_collector {
-                    let row = std::mem::take(&mut tc.current_row);
-                    if tc.in_header {
-                        tc.headers = row;
+                    if state.table_stack.last().is_some_and(|p| p.in_cell) {
+                        // Nested table: append its rendered output into the
+                        // enclosing cell so it renders in place.
+                        let parent = state.table_stack.last_mut().unwrap();
+                        if !parent.current_cell.content.is_empty()
+                            && !parent.current_cell.content.ends_with('\n')
+                        {
+                            parent.current_cell.content.push('\n');
+                        }
+                        parent.current_cell.content.push_str(table_md.trim_end());
                     } else {
-                        tc.rows.push(row);
+                        state.push_str(&table_md);
+                        state.plain_push_str(&table_plain);
                     }
                 }
             }
+            "thead" => {
+                if let Some(tc) = state.table_stack.last_mut() {
+                    tc.in_header = false;
+                }
+            }
+            "tr" => {
+                if let Some(tc) = state.table_stack.last_mut() {
+                    let row = std::mem::take(&mut tc.current_row);
+                    tc.rows.push(row);
+                }
+            }
             "th" | "td" => {
-                if let Some(tc) = &mut state.table_collector {
-                    let cell = std::mem::take(&mut tc.current_cell);
-                    tc.current_row.push(cell.trim().to_string());
+                if let Some(tc) = state.table_stack.last_mut() {
+                    let mut cell = std::mem::take(&mut tc.current_cell);
+                    cell.content = cell.content.trim().to_string();
+                    tc.current_row.cells.push(cell);
                     tc.in_cell = false;
                 }
             }
@@ -557,10 +628,9 @@ fn handle_text(state: &mut WalkerState, text: &scraper::node::Text) {
     let raw = text.text.as_ref();
 
     // Inside a table cell: accumulate into the cell buffer (shared for both outputs)
-    if let Some(tc) = &mut state.table_collector {
+    if let Some(tc) = state.table_stack.last_mut() {
         if tc.in_cell {
-            tc.current_cell.push_str(raw);
-            return;
+            tc.current_cell.content.push_str(raw);
         }
         // Text outside cells but inside table (e.g. whitespace between tags) — ignore
         return;
@@ -662,32 +732,262 @@ fn collapse_whitespace(s: &str) -> String {
     result
 }
 
+/// Resolve `rowspan` by inserting empty placeholder cells into lower rows.
+///
+/// HTML declares a vertical span on the top cell and omits the covered columns
+/// from subsequent rows. To get a rectangular grid, each spanned column is
+/// re-materialized as an empty cell in the rows it covers. Tracking uses an
+/// ordered list of `(column_index, remaining_rows)`, never a hash map, so output
+/// stays deterministic.
+fn normalize_html_rowspans(rows: &[HtmlRow]) -> Vec<HtmlRow> {
+    // Pending spans carried from earlier rows: (column, rows still to fill).
+    let mut pending: Vec<(usize, usize)> = Vec::new();
+    let mut out: Vec<HtmlRow> = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let mut new_cells: Vec<HtmlCell> = Vec::new();
+        // Spans started by cells in THIS row; added to `pending` only after the
+        // current row's old spans are decremented, so they survive to next row.
+        let mut new_spans: Vec<(usize, usize)> = Vec::new();
+        let mut col = 0usize;
+        let mut src = row.cells.iter();
+        let mut next = src.next();
+
+        loop {
+            if pending.iter().any(|(c, _)| *c == col) {
+                // A vertical span from an earlier row covers this column.
+                new_cells.push(HtmlCell {
+                    colspan: 1,
+                    rowspan: 1,
+                    ..Default::default()
+                });
+                col += 1;
+                continue;
+            }
+            match next {
+                Some(cell) => {
+                    let colspan = cell.colspan.max(1);
+                    if cell.rowspan > 1 {
+                        for k in 0..colspan {
+                            new_spans.push((col + k, cell.rowspan - 1));
+                        }
+                    }
+                    let mut c = cell.clone();
+                    c.rowspan = 1;
+                    new_cells.push(c);
+                    col += colspan;
+                    next = src.next();
+                }
+                None => break,
+            }
+        }
+
+        // Every old span covered exactly this row: decrement and drop exhausted.
+        pending = pending
+            .into_iter()
+            .filter_map(|(c, n)| n.checked_sub(1).filter(|&n| n > 0).map(|n| (c, n)))
+            .collect();
+        // Now register spans started this row so they apply to following rows.
+        pending.extend(new_spans);
+
+        out.push(HtmlRow {
+            cells: new_cells,
+            is_header_row: row.is_header_row,
+        });
+    }
+    out
+}
+
+/// Authoritative grid width of an HTML table: the max over rows of summed colspan.
+fn html_grid_width(rows: &[HtmlRow]) -> usize {
+    rows.iter()
+        .map(|r| r.cells.iter().map(|c| c.colspan.max(1)).sum::<usize>())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether a row's cells exactly tile the full grid width.
+fn html_row_tiles(row: &HtmlRow, grid_width: usize) -> bool {
+    grid_width > 0 && row.cells.iter().map(|c| c.colspan.max(1)).sum::<usize>() == grid_width
+}
+
+/// The layout role of an HTML table row (mirrors the DOCX classifier).
+#[derive(Debug, Clone, PartialEq)]
+enum HtmlRowKind {
+    Banner,
+    LabelValue,
+    Tiling,
+    Fallback,
+}
+
+/// Classify a single HTML row by its cell layout. First matching rule wins.
+fn classify_html_row(row: &HtmlRow, grid_width: usize) -> HtmlRowKind {
+    let cells = &row.cells;
+    if cells.len() == 1 && grid_width >= 1 && cells[0].colspan.max(1) >= grid_width {
+        return HtmlRowKind::Banner;
+    }
+    if cells.len() == 2
+        && grid_width >= 3
+        && cells[0].colspan.max(1) == 1
+        && cells[1].colspan.max(1) == grid_width - 1
+    {
+        return HtmlRowKind::LabelValue;
+    }
+    if html_row_tiles(row, grid_width) {
+        return HtmlRowKind::Tiling;
+    }
+    HtmlRowKind::Fallback
+}
+
+/// Whether a table is "simple": uniform widths, no spans, no header/data mixing.
+///
+/// Such tables render exactly as before (first row / `<thead>` as header),
+/// guaranteeing no regression for ordinary HTML tables.
+fn html_table_is_simple(rows: &[HtmlRow]) -> bool {
+    if rows.is_empty() {
+        return true;
+    }
+    let width = rows[0].cells.len();
+    rows.iter()
+        .all(|r| r.cells.len() == width && r.cells.iter().all(|c| c.colspan <= 1 && c.rowspan <= 1))
+}
+
+/// Expand a row's cells across `grid_width` columns for GFM rendering (empty-fill).
+fn expand_html_row(row: &HtmlRow, grid_width: usize) -> Vec<String> {
+    let mut cols: Vec<String> = Vec::with_capacity(grid_width);
+    for c in &row.cells {
+        let span = c.colspan.max(1);
+        cols.push(c.content.trim().to_string());
+        for _ in 1..span {
+            cols.push(String::new());
+        }
+    }
+    cols.resize(grid_width, String::new());
+    cols
+}
+
+/// Render a contiguous run of tiling rows as one GFM table (row 0 = header).
+fn render_html_grid(rows: &[&HtmlRow], grid_width: usize, plain: bool) -> String {
+    let expanded: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| expand_html_row(r, grid_width))
+        .collect();
+    let headers: Vec<&str> = expanded[0].iter().map(|s| s.as_str()).collect();
+    let data: Vec<Vec<&str>> = expanded[1..]
+        .iter()
+        .map(|r| r.iter().map(|s| s.as_str()).collect())
+        .collect();
+    if plain {
+        markdown::build_table_plain(&headers, &data)
+    } else {
+        markdown::build_table(&headers, &data)
+    }
+}
+
 /// Render a completed table collector into a table string.
 ///
-/// When `plain` is true, produces tab-separated output; otherwise produces
-/// a pipe-delimited Markdown table.
+/// Simple tables use the historical GFM path. Spanned/layout tables are
+/// linearized: banner rows become headings/bold paragraphs, label/value rows
+/// become `**Label:** value`, contiguous tiling rows become GFM tables, and
+/// irregular rows become small standalone tables. When `plain` is true the
+/// linearized parts flatten fully and grid parts stay tab-separated.
 fn render_table(tc: &TableCollector, plain: bool) -> String {
-    // If no explicit headers (no <thead>), use first row as headers
-    let (headers, data_rows) = if tc.headers.is_empty() && !tc.rows.is_empty() {
-        (tc.rows[0].clone(), &tc.rows[1..])
-    } else {
-        (tc.headers.clone(), tc.rows.as_slice())
-    };
-
-    if headers.is_empty() {
+    let rows = normalize_html_rowspans(&tc.rows);
+    if rows.is_empty() {
+        return String::new();
+    }
+    let grid_width = html_grid_width(&rows);
+    if grid_width == 0 {
         return String::new();
     }
 
-    let header_refs: Vec<&str> = headers.iter().map(|s| s.as_str()).collect();
-    let row_refs: Vec<Vec<&str>> = data_rows
-        .iter()
-        .map(|row| row.iter().map(|s| s.as_str()).collect())
-        .collect();
-    if plain {
-        markdown::build_table_plain(&header_refs, &row_refs)
-    } else {
-        markdown::build_table(&header_refs, &row_refs)
+    // Simple table: historical behavior (header = thead row(s) or first row).
+    if html_table_is_simple(&rows) {
+        let header_idx = rows.iter().position(|r| r.is_header_row);
+        let (header_row, data): (&HtmlRow, Vec<&HtmlRow>) = match header_idx {
+            Some(i) => (&rows[i], rows.iter().filter(|r| !r.is_header_row).collect()),
+            None => (&rows[0], rows[1..].iter().collect()),
+        };
+        let headers: Vec<&str> = header_row
+            .cells
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect();
+        if headers.is_empty() {
+            return String::new();
+        }
+        let data_refs: Vec<Vec<&str>> = data
+            .iter()
+            .map(|r| r.cells.iter().map(|c| c.content.as_str()).collect())
+            .collect();
+        return if plain {
+            markdown::build_table_plain(&headers, &data_refs)
+        } else {
+            markdown::build_table(&headers, &data_refs)
+        };
     }
+
+    // Hybrid path: classify each row and coalesce contiguous tiling runs.
+    let mut out = String::new();
+    let mut grid_run: Vec<&HtmlRow> = Vec::new();
+    let flush_grid = |run: &mut Vec<&HtmlRow>, out: &mut String| {
+        if !run.is_empty() {
+            out.push_str(&render_html_grid(run, grid_width, plain));
+            out.push('\n');
+            run.clear();
+        }
+    };
+
+    for row in &rows {
+        match classify_html_row(row, grid_width) {
+            HtmlRowKind::Tiling => grid_run.push(row),
+            HtmlRowKind::Banner => {
+                flush_grid(&mut grid_run, &mut out);
+                let cell = &row.cells[0];
+                let text = cell.content.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                if plain {
+                    out.push_str(text);
+                    out.push_str("\n\n");
+                } else if cell.has_heading {
+                    out.push_str(&markdown::format_heading(cell.heading_level, text));
+                    out.push('\n');
+                } else {
+                    out.push_str(&format!("**{text}**\n\n"));
+                }
+            }
+            HtmlRowKind::LabelValue => {
+                flush_grid(&mut grid_run, &mut out);
+                let label = row.cells[0].content.trim().trim_end_matches(':');
+                let value = row.cells[1].content.trim();
+                if plain {
+                    out.push_str(label);
+                    out.push('\n');
+                    if !value.is_empty() {
+                        out.push_str(value);
+                        out.push('\n');
+                    }
+                    out.push('\n');
+                } else {
+                    out.push_str(&format!("**{label}:** {value}\n\n"));
+                }
+            }
+            HtmlRowKind::Fallback => {
+                flush_grid(&mut grid_run, &mut out);
+                let texts: Vec<&str> = row.cells.iter().map(|c| c.content.as_str()).collect();
+                if plain {
+                    out.push_str(&markdown::build_table_plain(&texts, &[]));
+                } else {
+                    out.push_str(&markdown::build_table(&texts, &[]));
+                }
+                out.push('\n');
+            }
+        }
+    }
+    flush_grid(&mut grid_run, &mut out);
+    out
 }
 
 #[cfg(test)]
@@ -882,6 +1182,154 @@ mod tests {
         </table>"#;
         let result = convert_html(html);
         assert!(result.markdown.contains("| 1 |  | 3 |"));
+    }
+
+    #[test]
+    fn test_html_table_colspan_preserved() {
+        // A full-width colspan banner over a 2-column data grid. Both data
+        // columns must survive (previously only the first was kept).
+        let html = r#"<table>
+            <tr><td colspan="2">Banner</td></tr>
+            <tr><td>A</td><td>B</td></tr>
+        </table>"#;
+        let result = convert_html(html);
+        assert!(result.markdown.contains("A"), "md: {}", result.markdown);
+        assert!(result.markdown.contains("B"), "md: {}", result.markdown);
+        assert!(
+            result.markdown.contains("| A | B |"),
+            "both columns missing: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_html_table_banner_bold() {
+        let html = r#"<table>
+            <tr><td colspan="3">Section</td></tr>
+            <tr><td>a</td><td>b</td><td>c</td></tr>
+        </table>"#;
+        let result = convert_html(html);
+        assert!(
+            result.markdown.contains("**Section**"),
+            "md: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_html_table_banner_heading() {
+        let html = r#"<table>
+            <tr><td colspan="3"><h2>Section</h2></td></tr>
+            <tr><td>a</td><td>b</td><td>c</td></tr>
+        </table>"#;
+        let result = convert_html(html);
+        assert!(
+            result.markdown.contains("## Section"),
+            "md: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_html_table_label_value() {
+        let html = r#"<table>
+            <tr><td>Date</td><td colspan="2">Monday</td></tr>
+            <tr><td>a</td><td>b</td><td>c</td></tr>
+        </table>"#;
+        let result = convert_html(html);
+        assert!(
+            result.markdown.contains("**Date:** Monday"),
+            "md: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_html_table_rowspan_preserved() {
+        // rowspan on the first column: the second data row's other columns must
+        // not shift left into the spanned column.
+        let html = r#"<table>
+            <tr><td rowspan="2">Merged</td><td>X1</td><td>Y1</td></tr>
+            <tr><td>X2</td><td>Y2</td></tr>
+        </table>"#;
+        let result = convert_html(html);
+        for needle in ["Merged", "X1", "Y1", "X2", "Y2"] {
+            assert!(
+                result.markdown.contains(needle),
+                "missing {needle}: {}",
+                result.markdown
+            );
+        }
+        // Second row: spanned column is empty, X2/Y2 stay in columns 2 and 3.
+        assert!(
+            result.markdown.contains("|  | X2 | Y2 |"),
+            "rowspan column not preserved: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_html_nested_table() {
+        let html = r#"<table>
+            <tr><td colspan="2">Outer</td></tr>
+            <tr><td>cell<table><tr><td>inner1</td><td>inner2</td></tr></table></td><td>right</td></tr>
+        </table>"#;
+        let result = convert_html(html);
+        for needle in ["Outer", "inner1", "inner2", "right"] {
+            assert!(
+                result.markdown.contains(needle),
+                "missing {needle}: {}",
+                result.markdown
+            );
+        }
+    }
+
+    #[test]
+    fn test_html_plain_linearized_flattened() {
+        let html = r#"<table>
+            <tr><td colspan="3">Section</td></tr>
+            <tr><td>Field</td><td colspan="2">Value</td></tr>
+            <tr><td>A</td><td>B</td><td>C</td></tr>
+        </table>"#;
+        let result = convert_html(html);
+        // Plain text: no markdown markers in linearized parts.
+        assert!(
+            result.plain_text.contains("Section"),
+            "plain: {}",
+            result.plain_text
+        );
+        assert!(
+            result.plain_text.contains("Field"),
+            "plain: {}",
+            result.plain_text
+        );
+        assert!(
+            result.plain_text.contains("Value"),
+            "plain: {}",
+            result.plain_text
+        );
+        assert!(
+            !result.plain_text.contains("**"),
+            "plain has markers: {}",
+            result.plain_text
+        );
+        // Grid region tab-separated.
+        assert!(
+            result.plain_text.contains("A\tB\tC"),
+            "plain grid not tabbed: {}",
+            result.plain_text
+        );
+    }
+
+    #[test]
+    fn test_html_simple_table_unchanged_deterministic() {
+        // A simple uniform table must use the historical GFM path and be stable.
+        let html = r#"<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>"#;
+        let r1 = convert_html(html);
+        let r2 = convert_html(html);
+        assert_eq!(r1.markdown, r2.markdown);
+        assert!(r1.markdown.contains("| a | b |"));
+        assert!(r1.markdown.contains("| c | d |"));
     }
 
     #[test]
