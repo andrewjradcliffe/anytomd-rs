@@ -22,6 +22,21 @@ const MAX_TABLE_COLS: usize = 4096;
 /// vertical span can materialize.
 const MAX_TABLE_ROWS: usize = 4096;
 
+/// Upper bound on the total number of grid cells materialized while resolving
+/// `rowspan` placeholders across an entire table.
+///
+/// `colspan` and `rowspan` are each clamped to 4096 independently, but their
+/// product is not, so a single `<td rowspan="4096" colspan="4096">` followed by
+/// thousands of empty `<tr>` rows could otherwise expand to ~16.7M cells
+/// (gigabytes of `HtmlCell`). This cap bounds the *product*: normalization stops
+/// emitting once the running total of output cells reaches this value
+/// (best-effort truncation, matching the silent style of the per-cell clamps).
+///
+/// 1_000_000 is far larger than any real-world table (a 1000x1000 grid) yet
+/// keeps peak `HtmlCell` allocation to the low hundreds of MB worst case, which
+/// is acceptable for a best-effort converter.
+const MAX_TABLE_CELLS: usize = 1_000_000;
+
 /// Converts HTML files to Markdown.
 pub struct HtmlConverter;
 
@@ -775,31 +790,79 @@ fn collapse_whitespace(s: &str) -> String {
 ///
 /// HTML declares a vertical span on the top cell and omits the covered columns
 /// from subsequent rows. To get a rectangular grid, each spanned column is
-/// re-materialized as an empty cell in the rows it covers. Tracking uses an
-/// ordered list of `(column_index, remaining_rows)`, never a hash map, so output
-/// stays deterministic.
+/// re-materialized as an empty cell in the rows it covers.
+///
+/// Carried vertical spans are tracked in a column-indexed `Vec<usize>` (the
+/// remaining rows still covered at each column), never a hash map, so coverage
+/// lookup is O(1), per-row bookkeeping is O(width), and output stays
+/// deterministic. The grid is bounded on two axes: each output row is capped at
+/// the table's provisional width (max summed `colspan` over rows, itself capped
+/// at `MAX_TABLE_COLS`) so a stray span cannot push a row past it, and the total
+/// number of materialized cells is capped at `MAX_TABLE_CELLS`. Both caps are
+/// no-ops for realistic tables and only truncate hostile inputs (e.g. a single
+/// `rowspan`x`colspan` cell that would otherwise expand quadratically).
 fn normalize_html_rowspans(rows: &[HtmlRow]) -> Vec<HtmlRow> {
-    // Pending spans carried from earlier rows: (column, rows still to fill).
-    let mut pending: Vec<(usize, usize)> = Vec::new();
+    // Provisional grid width: the widest row by summed colspan, capped so an
+    // extreme colspan cannot drive unbounded per-column allocation. This is the
+    // same quantity `html_grid_width` derives from the *normalized* rows, but
+    // computed up front from the raw rows so it can bound the work below.
+    let width = rows
+        .iter()
+        .map(|r| {
+            r.cells
+                .iter()
+                .map(|c| c.colspan.max(1))
+                .sum::<usize>()
+                .min(MAX_TABLE_COLS)
+        })
+        .max()
+        .unwrap_or(0)
+        .min(MAX_TABLE_COLS);
+
     let mut out: Vec<HtmlRow> = Vec::with_capacity(rows.len());
+    if width == 0 {
+        // No columns anywhere: preserve the (empty) rows verbatim.
+        for row in rows {
+            out.push(HtmlRow {
+                cells: Vec::new(),
+                is_header_row: row.is_header_row,
+            });
+        }
+        return out;
+    }
+
+    // Carried spans, indexed by column: remaining rows still covered at `col`.
+    // O(1) coverage lookup, O(width) decrement per row, no hash map.
+    let mut pending: Vec<usize> = vec![0; width];
+    // Spans started by THIS row; applied only after the current row's carried
+    // spans are decremented, so a cell never covers its own row.
+    let mut new_spans: Vec<usize> = vec![0; width];
+    // Running total of emitted cells across all output rows (memory bound).
+    let mut total_cells = 0usize;
 
     for row in rows {
+        new_spans.iter_mut().for_each(|s| *s = 0);
         let mut new_cells: Vec<HtmlCell> = Vec::new();
-        // Spans started by cells in THIS row; added to `pending` only after the
-        // current row's old spans are decremented, so they survive to next row.
-        let mut new_spans: Vec<(usize, usize)> = Vec::new();
         let mut col = 0usize;
         let mut src = row.cells.iter();
         let mut next = src.next();
 
-        loop {
-            if pending.iter().any(|(c, _)| *c == col) {
+        // Materialize columns left-to-right until the row reaches the grid width.
+        // The width cap is what makes the per-row work bounded; the original loop
+        // terminated on `next == None` with the column not covered, which for
+        // realistic tables coincides with `col == width`.
+        while col < width {
+            if total_cells >= MAX_TABLE_CELLS {
+                break;
+            }
+            if pending[col] > 0 {
                 // A vertical span from an earlier row covers this column.
                 new_cells.push(HtmlCell {
                     colspan: 1,
                     rowspan: 1,
                     ..Default::default()
                 });
+                total_cells += 1;
                 col += 1;
                 continue;
             }
@@ -808,31 +871,49 @@ fn normalize_html_rowspans(rows: &[HtmlRow]) -> Vec<HtmlRow> {
                     let colspan = cell.colspan.max(1);
                     if cell.rowspan > 1 {
                         for k in 0..colspan {
-                            new_spans.push((col + k, cell.rowspan - 1));
+                            let c = col + k;
+                            if c < width {
+                                new_spans[c] = cell.rowspan - 1;
+                            }
                         }
                     }
                     let mut c = cell.clone();
                     c.rowspan = 1;
                     new_cells.push(c);
+                    total_cells += 1;
                     col += colspan;
                     next = src.next();
                 }
+                // No carried span here and no source cells left: the row is
+                // complete (matches the original loop's `None` break). Trailing
+                // carried columns past the last real cell are still filled above
+                // because `pending[col] > 0` is checked before `next`.
                 None => break,
             }
         }
 
-        // Every old span covered exactly this row: decrement and drop exhausted.
-        pending = pending
-            .into_iter()
-            .filter_map(|(c, n)| n.checked_sub(1).filter(|&n| n > 0).map(|n| (c, n)))
-            .collect();
-        // Now register spans started this row so they apply to following rows.
-        pending.extend(new_spans);
+        // Every carried span covered exactly this row: decrement and drop the
+        // exhausted ones, then layer in the spans started by this row.
+        for (p, n) in pending.iter_mut().zip(new_spans.iter()) {
+            *p = p.saturating_sub(1).max(*n);
+        }
 
         out.push(HtmlRow {
             cells: new_cells,
             is_header_row: row.is_header_row,
         });
+
+        if total_cells >= MAX_TABLE_CELLS {
+            // Truncate the remaining rows: emit them empty so downstream row
+            // count stays consistent without further allocation.
+            for r in &rows[out.len()..] {
+                out.push(HtmlRow {
+                    cells: Vec::new(),
+                    is_header_row: r.is_header_row,
+                });
+            }
+            break;
+        }
     }
     out
 }
@@ -1492,6 +1573,66 @@ mod tests {
             result.markdown.len()
         );
         assert!(result.markdown.contains('X'));
+    }
+
+    #[test]
+    fn test_html_rowspan_colspan_product_bounded_no_dos() {
+        // A single <td rowspan=N colspan=N> followed by N-1 empty <tr> rows would,
+        // before the MAX_TABLE_CELLS cap, materialize ~N*N placeholder cells
+        // (~16.7M for N=4096) via normalize_html_rowspans. This exercises the
+        // ACTUAL normalize/expand path (the colspan-only DoS test hits Fallback and
+        // never expands). The result must be produced quickly and stay bounded.
+        let n = 4096;
+        let mut html = String::from("<table><tr>");
+        html.push_str(&format!(r#"<td rowspan="{n}" colspan="{n}">RC</td>"#));
+        html.push_str("</tr>");
+        for _ in 1..n {
+            html.push_str("<tr></tr>");
+        }
+        html.push_str("</table>");
+
+        let start = std::time::Instant::now();
+        let result = convert_html(&html);
+        let elapsed = start.elapsed();
+
+        // Without the MAX_TABLE_CELLS cap this would materialize ~16.7M cells
+        // (~1.6 GB) and render to gigabytes of markdown. The cap bounds the cell
+        // count (~MAX_TABLE_CELLS), so the markdown stays small relative to that
+        // catastrophic baseline. A few MB is the bounded steady state; the speed
+        // assertion below is the real DoS guard (no quadratic O(rows*width) scan).
+        assert!(
+            result.markdown.len() < 8_000_000,
+            "output not bounded: {} bytes",
+            result.markdown.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "normalize too slow: {elapsed:?}"
+        );
+        assert!(
+            result.markdown.contains("RC"),
+            "content dropped: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_html_rowspan_colspan_same_cell_grid() {
+        // A cell that spans 2 rows AND 2 columns simultaneously. The header row
+        // shows the real cell, one in-cell colspan blank, then the trailing cell;
+        // the data row shows two rowspan placeholders, then its own cell.
+        let html = r#"<table><tr><td rowspan="2" colspan="2">RC</td><td>X</td></tr><tr><td>Y</td></tr></table>"#;
+        let result = convert_html(html);
+        assert!(
+            result.markdown.contains("| RC |  | X |"),
+            "header grid wrong: {}",
+            result.markdown
+        );
+        assert!(
+            result.markdown.contains("|  |  | Y |"),
+            "data grid wrong: {}",
+            result.markdown
+        );
     }
 
     #[test]

@@ -396,8 +396,6 @@ struct DocxTable {
     current_row: DocxRow,
     /// In-progress cell being accumulated.
     current_cell: DocxCell,
-    /// Number of paragraphs seen so far in the current cell.
-    cell_paragraph_count: usize,
     /// Whether a `<w:tr>` is currently open in this frame.
     in_row: bool,
     /// Whether a `<w:tc>` is currently open in this frame.
@@ -1042,7 +1040,6 @@ fn parse_document(
                         let frame = table_stack.last_mut().unwrap();
                         frame.in_cell = true;
                         frame.current_cell = DocxCell::default();
-                        frame.cell_paragraph_count = 0;
                     }
                     "p" if in_body => {
                         in_paragraph = true;
@@ -1401,7 +1398,6 @@ fn parse_document(
                                 kind: current_para_kind.clone(),
                                 is_table: false,
                             });
-                            frame.cell_paragraph_count += 1;
                         } else {
                             // Normal paragraph finalization
                             let is_list =
