@@ -32,10 +32,11 @@ const MAX_TABLE_ROWS: usize = 4096;
 /// emitting once the running total of output cells reaches this value
 /// (best-effort truncation, matching the silent style of the per-cell clamps).
 ///
-/// 1_000_000 is far larger than any real-world table (a 1000x1000 grid) yet
-/// keeps peak `HtmlCell` allocation to the low hundreds of MB worst case, which
-/// is acceptable for a best-effort converter.
-const MAX_TABLE_CELLS: usize = 1_000_000;
+/// Every table renders as a single GFM grid, so all materialized cells are also
+/// escaped and joined into the output. 100_000 is far larger than any real-world
+/// table (e.g. 200x500) yet keeps both peak `HtmlCell` allocation and the
+/// rendered table size bounded to a few MB worst case.
+const MAX_TABLE_CELLS: usize = 100_000;
 
 /// Converts HTML files to Markdown.
 pub struct HtmlConverter;
@@ -129,10 +130,6 @@ struct HtmlCell {
     colspan: usize,
     /// Rows this cell spans (`rowspan`), always at least 1.
     rowspan: usize,
-    /// True when the cell contains a heading element (`<h1>`..`<h6>`).
-    has_heading: bool,
-    /// Heading level of the first contained heading, if any (for banner promotion).
-    heading_level: u8,
     /// Accumulated cell text.
     content: String,
     /// Rendered markdown of a nested table inside this cell, if any. Kept
@@ -334,23 +331,16 @@ fn handle_open(state: &mut WalkerState, node: &ego_tree::NodeRef<Node>) {
                 _ if state.skip_depth > 0 => {}
                 "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                     let level = tag[1..].parse::<u8>().unwrap_or(1);
-                    // A heading inside a table cell is recorded on the cell so a
-                    // banner row can be promoted to that heading level; the cell's
-                    // text is still accumulated normally (no heading markers).
+                    // A heading inside a table cell keeps its text inline in the
+                    // cell (no heading markers), but headings are block elements, so
+                    // separate their text from any preceding cell content so two
+                    // headings in one cell do not mash together (e.g. "FirstSecond").
                     if let Some(tc) = state.table_stack.last_mut()
                         && tc.in_cell
                     {
-                        // Headings are block elements: separate their text from any
-                        // preceding cell content so multiple headings in one cell do
-                        // not mash together (e.g. "FirstSecond").
                         let cur = &mut tc.current_cell.content;
                         if !cur.is_empty() && !cur.ends_with(char::is_whitespace) {
                             cur.push(' ');
-                        }
-                        // Record the first heading's level for banner promotion.
-                        if !tc.current_cell.has_heading {
-                            tc.current_cell.has_heading = true;
-                            tc.current_cell.heading_level = level;
                         }
                     }
                     if !state.in_table_cell() {
@@ -930,75 +920,13 @@ fn html_grid_width(rows: &[HtmlRow]) -> usize {
         .min(MAX_TABLE_COLS)
 }
 
-/// Whether a row's cells exactly tile the full grid width.
-fn html_row_tiles(row: &HtmlRow, grid_width: usize) -> bool {
-    grid_width > 0 && row.cells.iter().map(|c| c.colspan.max(1)).sum::<usize>() == grid_width
-}
-
-/// The layout role of an HTML table row (mirrors the DOCX classifier).
-#[derive(Debug, Clone, PartialEq)]
-enum HtmlRowKind {
-    Banner,
-    LabelValue,
-    Tiling,
-    Fallback,
-}
-
 /// Whether any cell in the row contains a nested table.
 ///
-/// Such rows cannot be flattened into single grid cells, so they are linearized
-/// (classified `Fallback`) and their nested tables emitted as standalone blocks.
+/// A nested table cannot live inside a single GFM cell, so a table containing one
+/// is linearized (its cells' text and nested tables emitted as standalone blocks)
+/// rather than rendered as a grid.
 fn html_row_has_nested_table(row: &HtmlRow) -> bool {
     row.cells.iter().any(|c| c.has_nested_table())
-}
-
-/// Classify a single HTML row by its cell layout. First matching rule wins.
-fn classify_html_row(row: &HtmlRow, grid_width: usize) -> HtmlRowKind {
-    let cells = &row.cells;
-    // A row whose cell holds a nested table cannot become a grid cell; linearize.
-    if html_row_has_nested_table(row) {
-        return HtmlRowKind::Fallback;
-    }
-    if cells.len() == 1 && grid_width >= 1 && cells[0].colspan.max(1) >= grid_width {
-        return HtmlRowKind::Banner;
-    }
-    // Label/value requires a non-empty label cell — an empty label (e.g. a
-    // vertical-merge placeholder) would render a bare `**:**`.
-    if cells.len() == 2
-        && grid_width >= 3
-        && cells[0].colspan.max(1) == 1
-        && cells[1].colspan.max(1) == grid_width - 1
-        && !cells[0].content.trim().is_empty()
-    {
-        return HtmlRowKind::LabelValue;
-    }
-    if html_row_tiles(row, grid_width) {
-        return HtmlRowKind::Tiling;
-    }
-    HtmlRowKind::Fallback
-}
-
-/// Whether a table is "simple": uniform widths, no spans, no header/data mixing.
-///
-/// Such tables render exactly as before (first row / `<thead>` as header),
-/// guaranteeing no regression for ordinary HTML tables.
-fn html_table_is_simple(rows: &[HtmlRow]) -> bool {
-    if rows.is_empty() {
-        return true;
-    }
-    // A nested table inside any cell forces the hybrid path so the inner table is
-    // emitted as a standalone block rather than escaped into a single cell.
-    if rows.iter().any(html_row_has_nested_table) {
-        return false;
-    }
-    // More than one header row cannot be represented by a single GFM header, so
-    // route it through the hybrid path (which renders header rows as a grid).
-    if rows.iter().filter(|r| r.is_header_row).count() > 1 {
-        return false;
-    }
-    let width = rows[0].cells.len();
-    rows.iter()
-        .all(|r| r.cells.len() == width && r.cells.iter().all(|c| c.colspan <= 1 && c.rowspan <= 1))
 }
 
 /// Expand a row's cells across `grid_width` columns for GFM rendering (empty-fill).
@@ -1035,11 +963,16 @@ fn render_html_grid(rows: &[&HtmlRow], grid_width: usize, plain: bool) -> String
 
 /// Render a completed table collector into a table string.
 ///
-/// Simple tables use the historical GFM path. Spanned/layout tables are
-/// linearized: banner rows become headings/bold paragraphs, label/value rows
-/// become `**Label:** value`, contiguous tiling rows become GFM tables, and
-/// irregular rows become small standalone tables. When `plain` is true the
-/// linearized parts flatten fully and grid parts stay tab-separated.
+/// Every table — uniform, merged, or layout — renders as a single GFM table of
+/// the authoritative grid width: horizontal spans are empty-filled, vertical
+/// spans (`rowspan`) are materialized as blank placeholder cells, and the first
+/// row is the header. This is deliberately uniform: a merged/layout table is kept
+/// as one table rather than being split into headings and `**Label:** value`
+/// lines, so structure stays consistent for downstream (LLM) consumers.
+///
+/// The one exception is a table that contains a nested table: a nested table
+/// cannot live inside a single GFM cell, so such a table is linearized — each
+/// cell's text and any nested table are emitted as standalone blocks.
 fn render_table(tc: &TableCollector, plain: bool) -> String {
     let rows = normalize_html_rowspans(&tc.rows);
     if rows.is_empty() {
@@ -1050,125 +983,44 @@ fn render_table(tc: &TableCollector, plain: bool) -> String {
         return String::new();
     }
 
-    // Simple table: historical behavior (header = thead row(s) or first row).
-    if html_table_is_simple(&rows) {
-        let header_idx = rows.iter().position(|r| r.is_header_row);
-        let (header_row, data): (&HtmlRow, Vec<&HtmlRow>) = match header_idx {
-            Some(i) => (&rows[i], rows.iter().filter(|r| !r.is_header_row).collect()),
-            None => (&rows[0], rows[1..].iter().collect()),
-        };
-        let headers: Vec<&str> = header_row
-            .cells
-            .iter()
-            .map(|c| c.content.as_str())
-            .collect();
-        if headers.is_empty() {
-            return String::new();
-        }
-        let data_refs: Vec<Vec<&str>> = data
-            .iter()
-            .map(|r| r.cells.iter().map(|c| c.content.as_str()).collect())
-            .collect();
-        return if plain {
-            markdown::build_table_plain(&headers, &data_refs)
-        } else {
-            markdown::build_table(&headers, &data_refs)
-        };
-    }
-
-    // Hybrid path: classify each row and coalesce contiguous tiling runs.
-    let mut out = String::new();
-    let mut grid_run: Vec<&HtmlRow> = Vec::new();
-    let flush_grid = |run: &mut Vec<&HtmlRow>, out: &mut String| {
-        if !run.is_empty() {
-            out.push_str(&render_html_grid(run, grid_width, plain));
-            out.push('\n');
-            run.clear();
-        }
-    };
-
-    for row in &rows {
-        match classify_html_row(row, grid_width) {
-            HtmlRowKind::Tiling => grid_run.push(row),
-            HtmlRowKind::Banner => {
-                flush_grid(&mut grid_run, &mut out);
-                let cell = &row.cells[0];
-                let text = cell.content.trim();
-                if text.is_empty() {
-                    continue;
-                }
-                if plain {
+    // A nested table cannot be a grid cell: linearize the whole table, emitting
+    // each cell's text and any nested table as standalone blocks in order.
+    if rows.iter().any(html_row_has_nested_table) {
+        let mut out = String::new();
+        for row in &rows {
+            for c in &row.cells {
+                let text = c.content.trim();
+                if !text.is_empty() {
                     out.push_str(text);
-                    out.push_str("\n\n");
-                } else if cell.has_heading {
-                    out.push_str(&markdown::format_heading(cell.heading_level, text));
                     out.push('\n');
-                } else {
-                    out.push_str(&format!("**{text}**\n\n"));
-                }
-            }
-            HtmlRowKind::LabelValue => {
-                flush_grid(&mut grid_run, &mut out);
-                let label_full = row.cells[0].content.trim();
-                // Strip a single trailing colon (we re-add one); keep extra colons.
-                let label = label_full.strip_suffix(':').unwrap_or(label_full);
-                let value = row.cells[1].content.trim();
-                if plain {
-                    out.push_str(label);
-                    out.push('\n');
-                    if !value.is_empty() {
-                        out.push_str(value);
+                    if !plain {
                         out.push('\n');
                     }
-                    out.push('\n');
-                } else {
-                    out.push_str(&format!("**{label}:** {value}\n\n"));
                 }
-            }
-            HtmlRowKind::Fallback => {
-                flush_grid(&mut grid_run, &mut out);
-                if html_row_has_nested_table(row) {
-                    // Emit each cell's text and any nested table as standalone
-                    // blocks, separated by blank lines, so a nested table is never
-                    // escaped into a single grid cell.
-                    for c in &row.cells {
-                        let text = c.content.trim();
-                        if !text.is_empty() {
-                            if plain {
-                                out.push_str(text);
-                                out.push('\n');
-                            } else {
-                                out.push_str(text);
-                                out.push_str("\n\n");
-                            }
-                        }
-                        if c.has_nested_table() {
-                            if plain {
-                                out.push_str(c.nested_plain.trim_end());
-                                out.push('\n');
-                            } else {
-                                out.push_str(c.nested_md.trim_end());
-                                out.push_str("\n\n");
-                            }
-                        }
-                    }
+                if c.has_nested_table() {
                     if plain {
+                        out.push_str(c.nested_plain.trim_end());
                         out.push('\n');
-                    }
-                } else {
-                    let texts: Vec<&str> = row.cells.iter().map(|c| c.content.as_str()).collect();
-                    if plain {
-                        out.push_str(&markdown::build_table_plain(&texts, &[]));
                     } else {
-                        out.push_str(&markdown::build_table(&texts, &[]));
+                        out.push_str(c.nested_md.trim_end());
+                        out.push_str("\n\n");
                     }
-                    out.push('\n');
                 }
             }
         }
+        if plain {
+            out.push('\n');
+        }
+        return out;
     }
-    flush_grid(&mut grid_run, &mut out);
-    out
+
+    // Common case: one empty-filled GFM grid over every row (row 0 is the header).
+    // Bound the rendered area (rows x grid_width) at MAX_TABLE_CELLS: since every
+    // cell is escaped and emitted, an extreme grid would otherwise produce
+    // gigabytes of markdown. Excess rows are dropped (best-effort truncation).
+    let max_rows = (MAX_TABLE_CELLS / grid_width).max(1);
+    let row_refs: Vec<&HtmlRow> = rows.iter().take(max_rows).collect();
+    render_html_grid(&row_refs, grid_width, plain)
 }
 
 #[cfg(test)]
@@ -1384,42 +1236,65 @@ mod tests {
     }
 
     #[test]
-    fn test_html_table_banner_bold() {
+    fn test_html_table_full_width_banner_is_grid_row() {
+        // A full-width colspan row stays a grid row (empty-filled), not a heading
+        // or bold paragraph.
         let html = r#"<table>
             <tr><td colspan="3">Section</td></tr>
             <tr><td>a</td><td>b</td><td>c</td></tr>
         </table>"#;
         let result = convert_html(html);
         assert!(
-            result.markdown.contains("**Section**"),
+            result.markdown.contains("| Section |  |  |"),
+            "banner not an empty-filled header: {}",
+            result.markdown
+        );
+        assert!(
+            result.markdown.contains("| a | b | c |"),
             "md: {}",
             result.markdown
         );
+        assert!(!result.markdown.contains('#'), "md: {}", result.markdown);
+        assert!(!result.markdown.contains("**"), "md: {}", result.markdown);
     }
 
     #[test]
-    fn test_html_table_banner_heading() {
+    fn test_html_table_heading_in_banner_inline() {
+        // A heading inside a full-width cell keeps its text inline in the grid cell
+        // (no `##` promotion).
         let html = r#"<table>
             <tr><td colspan="3"><h2>Section</h2></td></tr>
             <tr><td>a</td><td>b</td><td>c</td></tr>
         </table>"#;
         let result = convert_html(html);
         assert!(
-            result.markdown.contains("## Section"),
+            result.markdown.contains("| Section |  |  |"),
+            "md: {}",
+            result.markdown
+        );
+        assert!(
+            !result.markdown.contains("## Section"),
             "md: {}",
             result.markdown
         );
     }
 
     #[test]
-    fn test_html_table_label_value() {
+    fn test_html_table_label_value_kept_as_grid_row() {
+        // A narrow-label + wide-value row stays a grid row (empty-filled), not a
+        // `**Label:** value` line.
         let html = r#"<table>
             <tr><td>Date</td><td colspan="2">Monday</td></tr>
             <tr><td>a</td><td>b</td><td>c</td></tr>
         </table>"#;
         let result = convert_html(html);
         assert!(
-            result.markdown.contains("**Date:** Monday"),
+            result.markdown.contains("| Date | Monday |  |"),
+            "md: {}",
+            result.markdown
+        );
+        assert!(
+            !result.markdown.contains("**Date:**"),
             "md: {}",
             result.markdown
         );
@@ -1521,12 +1396,13 @@ mod tests {
     }
 
     #[test]
-    fn test_html_label_double_colon_preserved() {
+    fn test_html_label_colons_preserved_in_grid_cell() {
+        // A label cell keeps its text verbatim (colons included) as a grid cell.
         let html = r#"<table><tr><td>Ratio::</td><td colspan="2">val</td></tr><tr><td>p</td><td>q</td><td>r</td></tr></table>"#;
         let result = convert_html(html);
         assert!(
-            result.markdown.contains("**Ratio::** val"),
-            "colon collapsed: {}",
+            result.markdown.contains("| Ratio:: | val |  |"),
+            "label not a grid cell: {}",
             result.markdown
         );
     }
@@ -1596,10 +1472,11 @@ mod tests {
         let elapsed = start.elapsed();
 
         // Without the MAX_TABLE_CELLS cap this would materialize ~16.7M cells
-        // (~1.6 GB) and render to gigabytes of markdown. The cap bounds the cell
-        // count (~MAX_TABLE_CELLS), so the markdown stays small relative to that
-        // catastrophic baseline. A few MB is the bounded steady state; the speed
-        // assertion below is the real DoS guard (no quadratic O(rows*width) scan).
+        // (~1.6 GB) and, since every table renders as one GFM grid, escape and
+        // join all of them into gigabytes of markdown. The cap bounds the cell
+        // count (~MAX_TABLE_CELLS), so both the materialized cells and the rendered
+        // grid stay bounded. The speed assertion below is the real DoS guard (no
+        // quadratic O(rows*width) scan).
         assert!(
             result.markdown.len() < 8_000_000,
             "output not bounded: {} bytes",

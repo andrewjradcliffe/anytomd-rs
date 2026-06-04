@@ -336,20 +336,18 @@ enum VMerge {
 /// One paragraph of content buffered inside a table cell.
 ///
 /// Cells may contain multiple paragraphs; keeping them as separate blocks lets
-/// the renderer preserve paragraph breaks when linearizing a layout table and
-/// detect heading-styled banner paragraphs. Markdown form retains bold/italic/
-/// link/image syntax; plain form has none.
+/// the renderer preserve paragraph breaks when linearizing a table that contains
+/// a nested table. Markdown form retains bold/italic/link/image syntax; plain
+/// form has none.
 #[derive(Debug, Clone)]
 struct DocxCellBlock {
     /// Markdown form of the paragraph (untrimmed, as produced by the run merge).
     md: String,
     /// Plain-text form of the paragraph (untrimmed, no markdown markers).
     plain: String,
-    /// The paragraph's block kind (used for banner heading detection).
-    kind: ParagraphKind,
     /// True when this block is a fully-rendered nested table (multi-line GFM).
-    /// Such blocks cannot be collapsed into a single grid cell, so any row that
-    /// contains one is linearized and the table is emitted as a standalone block.
+    /// Such blocks cannot be collapsed into a single grid cell, so any table that
+    /// contains one is linearized and the nested table emitted as a standalone block.
     is_table: bool,
 }
 
@@ -503,12 +501,16 @@ fn render_docx_grid(rows: &[&DocxRow], grid_width: usize) -> (String, String) {
 
 /// Render a buffered table to `(markdown, plain_text)`.
 ///
-/// Simple tables (uniform widths, no merges) use the historical GFM path
-/// unchanged. Spanned or layout tables are rendered with hybrid linearization:
-/// banner rows become headings/bold paragraphs, label/value rows become
-/// `**Label:** value`, contiguous tiling rows become GFM tables, and irregular
-/// rows become small standalone tables. Plain text linearizes fully (no markers)
-/// for non-grid segments and stays tab-separated for grid segments.
+/// Every table — uniform, merged, or layout — renders as a single GFM table of
+/// the authoritative grid width: horizontal spans are empty-filled, vertical-merge
+/// continuations are blank, and the first row is the header. This is deliberately
+/// uniform: a merged/layout table is kept as one table rather than being split
+/// into headings and `**Label:** value` lines, so structure stays consistent for
+/// downstream (LLM) consumers.
+///
+/// The one exception is a table that contains a nested table: a nested table
+/// cannot live inside a single GFM cell, so such a table is linearized — each
+/// cell's paragraphs and any nested table are emitted as standalone blocks.
 fn render_docx_table(table: &DocxTable) -> (String, String) {
     if table.rows.is_empty() {
         return (String::new(), String::new());
@@ -519,138 +521,30 @@ fn render_docx_table(table: &DocxTable) -> (String, String) {
         return (String::new(), String::new());
     }
 
-    // Simple table: exact historical behavior (row 0 header, flattened cells).
-    if docx_table_is_simple(table) {
-        let row_texts: Vec<Vec<String>> = table
-            .rows
-            .iter()
-            .map(|r| r.cells.iter().map(join_cell_blocks_md).collect())
-            .collect();
-        let row_texts_plain: Vec<Vec<String>> = table
-            .rows
-            .iter()
-            .map(|r| r.cells.iter().map(join_cell_blocks_plain).collect())
-            .collect();
-        let headers: Vec<&str> = row_texts[0].iter().map(|s| s.as_str()).collect();
-        let data: Vec<Vec<&str>> = row_texts[1..]
-            .iter()
-            .map(|r| r.iter().map(|s| s.as_str()).collect())
-            .collect();
-        let md = build_table(&headers, &data);
-        let headers_p: Vec<&str> = row_texts_plain[0].iter().map(|s| s.as_str()).collect();
-        let data_p: Vec<Vec<&str>> = row_texts_plain[1..]
-            .iter()
-            .map(|r| r.iter().map(|s| s.as_str()).collect())
-            .collect();
-        let plain = build_table_plain(&headers_p, &data_p);
-        return (md, plain);
+    // Common case: no nested tables → one empty-filled GFM grid.
+    if !table.rows.iter().any(docx_row_has_nested_table) {
+        let rows: Vec<&DocxRow> = table.rows.iter().collect();
+        return render_docx_grid(&rows, grid_width);
     }
 
-    // Hybrid path: classify rows and render each segment.
+    // A nested table cannot be a grid cell: linearize the whole table, emitting
+    // each cell's paragraphs and nested tables as standalone blocks in order.
     let mut md = String::new();
     let mut plain = String::new();
-    for seg in segment_docx_table(table, grid_width) {
-        match seg {
-            DocxSegment::Banner(row) => {
-                let cell = &row.cells[0];
-                let text = join_cell_blocks_md(cell);
-                if text.is_empty() {
+    for row in &table.rows {
+        for c in &row.cells {
+            for b in &c.blocks {
+                if b.md.trim().is_empty() {
                     continue;
                 }
-                // Heading if any of the banner's paragraphs is heading-styled
-                // (a banner cell often has a blank leading paragraph before the
-                // heading-styled title).
-                let level = cell.blocks.iter().find_map(|b| match b.kind {
-                    ParagraphKind::Heading(l) => Some(l),
-                    _ => None,
-                });
-                match level {
-                    Some(l) => md.push_str(&format_heading(l, &text)),
-                    None => md.push_str(&format!("**{text}**\n")),
-                }
-                md.push('\n');
-                plain.push_str(&join_cell_blocks_plain(cell));
-                plain.push_str("\n\n");
-            }
-            DocxSegment::LabelValue(row) => {
-                let label = join_cell_blocks_md(&row.cells[0]);
-                // Strip a single trailing colon if present (we re-add exactly one);
-                // do not collapse multiple colons in labels like "Ratio::".
-                let label = label.strip_suffix(':').unwrap_or(&label).to_string();
-                let value_cell = &row.cells[1];
-                // Markdown: bold label + first value paragraph inline, rest on
-                // following lines (paragraph breaks preserved).
-                let value_blocks: Vec<&DocxCellBlock> = value_cell
-                    .blocks
-                    .iter()
-                    .filter(|b| !b.md.trim().is_empty())
-                    .collect();
-                if value_blocks.is_empty() {
-                    md.push_str(&format!("**{label}:**\n\n"));
-                } else {
-                    md.push_str(&format!("**{label}:** {}\n", value_blocks[0].md.trim()));
-                    for b in &value_blocks[1..] {
-                        md.push('\n');
-                        md.push_str(b.md.trim());
-                        md.push('\n');
-                    }
-                    md.push('\n');
-                }
-                // Plain: fully flattened — label line then each value paragraph.
-                let label_plain = join_cell_blocks_plain(&row.cells[0]);
-                let label_plain = label_plain.strip_suffix(':').unwrap_or(&label_plain);
-                plain.push_str(label_plain);
+                md.push_str(b.md.trim_end());
+                md.push_str("\n\n");
+                plain.push_str(b.plain.trim_end());
                 plain.push('\n');
-                for b in value_cell
-                    .blocks
-                    .iter()
-                    .filter(|b| !b.plain.trim().is_empty())
-                {
-                    plain.push_str(b.plain.trim());
-                    plain.push('\n');
-                }
-                plain.push('\n');
-            }
-            DocxSegment::Grid(rows) => {
-                let (g_md, g_plain) = render_docx_grid(&rows, grid_width);
-                md.push_str(&g_md);
-                md.push('\n');
-                plain.push_str(&g_plain);
-                plain.push('\n');
-            }
-            DocxSegment::Fallback(row) => {
-                if docx_row_has_nested_table(row) {
-                    // The row carries a nested table: emit each block in place —
-                    // paragraphs as text, the nested table as a standalone block.
-                    // Every block is followed by a blank line so a sibling cell's
-                    // text after a nested table is not glued on as a table row.
-                    for c in &row.cells {
-                        for b in &c.blocks {
-                            if b.md.trim().is_empty() {
-                                continue;
-                            }
-                            md.push_str(b.md.trim_end());
-                            md.push_str("\n\n");
-                            plain.push_str(b.plain.trim_end());
-                            plain.push('\n');
-                        }
-                    }
-                    plain.push('\n');
-                } else {
-                    // Small standalone GFM table padded to the row's own cell count.
-                    let texts: Vec<String> = row.cells.iter().map(join_cell_blocks_md).collect();
-                    let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-                    md.push_str(&build_table(&refs, &[]));
-                    md.push('\n');
-                    let texts_p: Vec<String> =
-                        row.cells.iter().map(join_cell_blocks_plain).collect();
-                    let refs_p: Vec<&str> = texts_p.iter().map(|s| s.as_str()).collect();
-                    plain.push_str(&build_table_plain(&refs_p, &[]));
-                    plain.push('\n');
-                }
             }
         }
     }
+    plain.push('\n');
 
     (md, plain)
 }
@@ -680,130 +574,15 @@ fn docx_grid_width(t: &DocxTable) -> usize {
 /// Whether a row's cells exactly tile the full grid width.
 ///
 /// True when the summed `grid_span` over all cells equals `grid_width`.
-/// Continuation cells of a vertical merge still occupy their columns, so their
-/// `grid_span` is counted like any other cell's.
-fn docx_row_tiles(row: &DocxRow, grid_width: usize) -> bool {
-    grid_width > 0 && row.cells.iter().map(|c| c.grid_span.max(1)).sum::<usize>() == grid_width
-}
-
-/// The layout role of a table row, used to drive hybrid rendering.
-#[derive(Debug, Clone, PartialEq)]
-enum DocxRowKind {
-    /// A single cell spanning the full grid width (e.g. a section header).
-    Banner,
-    /// A narrow label cell followed by a wide value cell spanning the rest.
-    LabelValue,
-    /// Cells that exactly tile the grid width — eligible to stay a GFM table.
-    Tiling,
-    /// Anything else (irregular partial-width rows).
-    Fallback,
-}
-
 /// Whether any cell in the row contains a nested-table block.
 ///
-/// Such rows cannot be flattened into single grid cells, so they are linearized
-/// (classified `Fallback`) and their nested tables emitted as standalone blocks.
+/// A nested table cannot live inside a single GFM cell, so a table containing one
+/// is linearized (its cells' paragraphs and nested tables emitted as standalone
+/// blocks) rather than rendered as a grid.
 fn docx_row_has_nested_table(row: &DocxRow) -> bool {
     row.cells
         .iter()
         .any(|c| c.blocks.iter().any(|b| b.is_table))
-}
-
-/// Classify a single row by its cell layout. First matching rule wins.
-fn classify_docx_row(row: &DocxRow, grid_width: usize) -> DocxRowKind {
-    let cells = &row.cells;
-    // A row whose cell holds a nested table cannot become a grid cell; linearize.
-    if docx_row_has_nested_table(row) {
-        return DocxRowKind::Fallback;
-    }
-    // Banner: one cell covering the whole width.
-    if cells.len() == 1 && grid_width >= 1 && cells[0].grid_span.max(1) >= grid_width {
-        return DocxRowKind::Banner;
-    }
-    // Label/value: narrow label (1 column) + wide value cell that genuinely
-    // spans the remaining columns. The value must span at least 2 columns (so
-    // `grid_width >= 3`); in a 2-column grid a `[1, 1]` row is an ordinary data
-    // row, not a label/value pair. The label cell must be non-empty — an empty
-    // label (e.g. a vertical-merge placeholder) would render a bare `**:**`.
-    if cells.len() == 2
-        && grid_width >= 3
-        && cells[0].grid_span.max(1) == 1
-        && cells[1].grid_span.max(1) == grid_width - 1
-        && !join_cell_blocks_md(&cells[0]).trim().is_empty()
-    {
-        return DocxRowKind::LabelValue;
-    }
-    // Tiling: cells exactly fill the grid width.
-    if docx_row_tiles(row, grid_width) {
-        return DocxRowKind::Tiling;
-    }
-    DocxRowKind::Fallback
-}
-
-/// A contiguous run of rows sharing a layout role, ready to render as one block.
-#[derive(Debug)]
-enum DocxSegment<'a> {
-    /// A banner row → heading (if styled) or bold paragraph.
-    Banner(&'a DocxRow),
-    /// A label/value row → `**Label:** value`.
-    LabelValue(&'a DocxRow),
-    /// A maximal run of consecutive tiling rows → one GFM table (row 0 = header).
-    Grid(Vec<&'a DocxRow>),
-    /// An irregular row → its own small GFM table.
-    Fallback(&'a DocxRow),
-}
-
-/// Segment a table's rows into ordered render units.
-///
-/// Consecutive `Tiling` rows are coalesced into a single `Grid` segment; banner,
-/// label/value, and fallback rows are emitted as singletons in document order.
-/// Iterates an ordered slice only, so output ordering is deterministic.
-fn segment_docx_table<'a>(t: &'a DocxTable, grid_width: usize) -> Vec<DocxSegment<'a>> {
-    let mut segments: Vec<DocxSegment<'a>> = Vec::new();
-    let mut grid_run: Vec<&'a DocxRow> = Vec::new();
-
-    for row in &t.rows {
-        match classify_docx_row(row, grid_width) {
-            DocxRowKind::Tiling => grid_run.push(row),
-            kind => {
-                if !grid_run.is_empty() {
-                    segments.push(DocxSegment::Grid(std::mem::take(&mut grid_run)));
-                }
-                match kind {
-                    DocxRowKind::Banner => segments.push(DocxSegment::Banner(row)),
-                    DocxRowKind::LabelValue => segments.push(DocxSegment::LabelValue(row)),
-                    _ => segments.push(DocxSegment::Fallback(row)),
-                }
-            }
-        }
-    }
-    if !grid_run.is_empty() {
-        segments.push(DocxSegment::Grid(grid_run));
-    }
-    segments
-}
-
-/// Whether a table is "simple" and should use the plain GFM path unchanged.
-///
-/// True when no cell carries a horizontal or vertical merge and every row has the
-/// same cell count. Such tables render exactly as they did before hybrid handling,
-/// guaranteeing zero regression for ordinary data tables.
-fn docx_table_is_simple(t: &DocxTable) -> bool {
-    if t.rows.is_empty() {
-        return true;
-    }
-    // A nested table inside any cell forces the hybrid path so the inner table
-    // can be emitted as a standalone block rather than flattened into a cell.
-    if t.rows.iter().any(docx_row_has_nested_table) {
-        return false;
-    }
-    let width = t.rows[0].cells.len();
-    t.rows.iter().all(|r| {
-        r.cells.len() == width
-            && r.cells
-                .iter()
-                .all(|c| c.grid_span <= 1 && c.v_merge == VMerge::None)
-    })
 }
 
 /// Merge adjacent segments with the same formatting, then apply `wrap_formatting`
@@ -1346,7 +1125,6 @@ fn parse_document(
                                     DocxCellBlock {
                                         md: table_md,
                                         plain: table_plain,
-                                        kind: ParagraphKind::Normal,
                                         is_table: true,
                                     },
                                 );
@@ -1395,7 +1173,6 @@ fn parse_document(
                             frame.current_cell.blocks.push(DocxCellBlock {
                                 md: current_para_text.clone(),
                                 plain: current_para_text_plain.clone(),
-                                kind: current_para_kind.clone(),
                                 is_table: false,
                             });
                         } else {
@@ -2948,7 +2725,8 @@ mod tests {
     fn test_docx_table_gridspan_banner_preserves_all_columns() {
         // A full-width gridSpan banner over a two-column data row. The banner must
         // not collapse the table to one column: both "A" and "B" must survive.
-        // (This previously truncated every row to its first cell.)
+        // (This previously truncated every row to its first cell.) The whole table
+        // renders as one empty-filled GFM grid.
         let body = r#"<w:tbl><w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>Merged</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
         let doc = wrap_body(body);
         let data = build_test_docx(&doc, None, None);
@@ -2956,10 +2734,10 @@ mod tests {
         let result = converter
             .convert(&data, &ConversionOptions::default())
             .unwrap();
-        // The banner row linearizes to a bold paragraph (not a one-column table).
+        // The banner is the header row of the grid, empty-filled to full width.
         assert!(
-            result.markdown.contains("**Merged**"),
-            "banner missing: {}",
+            result.markdown.contains("| Merged |  |"),
+            "banner not an empty-filled header: {}",
             result.markdown
         );
         // The data row keeps both columns.
@@ -3004,7 +2782,6 @@ mod tests {
             blocks: vec![DocxCellBlock {
                 md: text.to_string(),
                 plain: text.to_string(),
-                kind: ParagraphKind::Normal,
                 is_table: false,
             }],
         }
@@ -3042,177 +2819,7 @@ mod tests {
         assert_eq!(docx_grid_width(&t), 3);
     }
 
-    #[test]
-    fn test_docx_row_tiles_exact() {
-        let r = row(vec![
-            cell("a", 1, VMerge::None),
-            cell("b", 1, VMerge::None),
-            cell("c", 1, VMerge::None),
-        ]);
-        assert!(docx_row_tiles(&r, 3));
-    }
-
-    #[test]
-    fn test_docx_row_tiles_banner_full_width() {
-        // A single full-width cell technically tiles; banner classification (which
-        // is checked before tiling) is what distinguishes it.
-        let r = row(vec![cell("a", 3, VMerge::None)]);
-        assert!(docx_row_tiles(&r, 3));
-    }
-
-    #[test]
-    fn test_docx_row_tiles_short_false() {
-        let r = row(vec![cell("a", 1, VMerge::None), cell("b", 1, VMerge::None)]);
-        assert!(!docx_row_tiles(&r, 3));
-    }
-
-    #[test]
-    fn test_classify_docx_row_banner() {
-        let r = row(vec![cell("Section", 5, VMerge::None)]);
-        assert_eq!(classify_docx_row(&r, 5), DocxRowKind::Banner);
-    }
-
-    #[test]
-    fn test_classify_docx_row_label_value() {
-        let r = row(vec![
-            cell("Label", 1, VMerge::None),
-            cell("Value", 4, VMerge::None),
-        ]);
-        assert_eq!(classify_docx_row(&r, 5), DocxRowKind::LabelValue);
-    }
-
-    #[test]
-    fn test_classify_docx_row_tiling() {
-        let r = row(vec![
-            cell("a", 1, VMerge::None),
-            cell("b", 1, VMerge::None),
-            cell("c", 1, VMerge::None),
-        ]);
-        assert_eq!(classify_docx_row(&r, 3), DocxRowKind::Tiling);
-    }
-
-    #[test]
-    fn test_classify_docx_row_fallback() {
-        // Two narrow cells in a 5-column grid: neither banner, label/value, nor tiling.
-        let r = row(vec![cell("a", 1, VMerge::None), cell("b", 1, VMerge::None)]);
-        assert_eq!(classify_docx_row(&r, 5), DocxRowKind::Fallback);
-    }
-
-    #[test]
-    fn test_segment_docx_banner_then_grid() {
-        let t = DocxTable {
-            grid_width: 3,
-            rows: vec![
-                row(vec![cell("Banner", 3, VMerge::None)]),
-                row(vec![
-                    cell("a", 1, VMerge::None),
-                    cell("b", 1, VMerge::None),
-                    cell("c", 1, VMerge::None),
-                ]),
-                row(vec![
-                    cell("d", 1, VMerge::None),
-                    cell("e", 1, VMerge::None),
-                    cell("f", 1, VMerge::None),
-                ]),
-            ],
-            ..Default::default()
-        };
-        let segs = segment_docx_table(&t, 3);
-        assert_eq!(segs.len(), 2);
-        assert!(matches!(segs[0], DocxSegment::Banner(_)));
-        match &segs[1] {
-            DocxSegment::Grid(rows) => assert_eq!(rows.len(), 2),
-            other => panic!("expected Grid, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_segment_docx_grid_split_by_labelvalue() {
-        let t = DocxTable {
-            grid_width: 3,
-            rows: vec![
-                row(vec![
-                    cell("a", 1, VMerge::None),
-                    cell("b", 1, VMerge::None),
-                    cell("c", 1, VMerge::None),
-                ]),
-                row(vec![cell("L", 1, VMerge::None), cell("V", 2, VMerge::None)]),
-                row(vec![
-                    cell("d", 1, VMerge::None),
-                    cell("e", 1, VMerge::None),
-                    cell("f", 1, VMerge::None),
-                ]),
-            ],
-            ..Default::default()
-        };
-        let segs = segment_docx_table(&t, 3);
-        assert_eq!(segs.len(), 3);
-        assert!(matches!(segs[0], DocxSegment::Grid(_)));
-        assert!(matches!(segs[1], DocxSegment::LabelValue(_)));
-        assert!(matches!(segs[2], DocxSegment::Grid(_)));
-    }
-
-    #[test]
-    fn test_docx_table_is_simple_true() {
-        let t = DocxTable {
-            grid_width: 2,
-            rows: vec![
-                row(vec![cell("a", 1, VMerge::None), cell("b", 1, VMerge::None)]),
-                row(vec![cell("c", 1, VMerge::None), cell("d", 1, VMerge::None)]),
-            ],
-            ..Default::default()
-        };
-        assert!(docx_table_is_simple(&t));
-    }
-
-    #[test]
-    fn test_docx_table_is_simple_false_gridspan() {
-        let t = DocxTable {
-            grid_width: 2,
-            rows: vec![row(vec![cell("a", 2, VMerge::None)])],
-            ..Default::default()
-        };
-        assert!(!docx_table_is_simple(&t));
-    }
-
-    #[test]
-    fn test_docx_table_is_simple_false_vmerge() {
-        let t = DocxTable {
-            grid_width: 1,
-            rows: vec![row(vec![cell("a", 1, VMerge::Restart)])],
-            ..Default::default()
-        };
-        assert!(!docx_table_is_simple(&t));
-    }
-
-    #[test]
-    fn test_docx_table_is_simple_false_ragged() {
-        let t = DocxTable {
-            grid_width: 2,
-            rows: vec![
-                row(vec![cell("a", 1, VMerge::None), cell("b", 1, VMerge::None)]),
-                row(vec![cell("c", 1, VMerge::None)]),
-            ],
-            ..Default::default()
-        };
-        assert!(!docx_table_is_simple(&t));
-    }
-
-    // ---- Hybrid render unit tests ----
-
-    /// Build a cell whose first paragraph carries the given kind (for banner tests).
-    fn cell_kind(text: &str, grid_span: usize, kind: ParagraphKind) -> DocxCell {
-        DocxCell {
-            grid_span,
-            v_merge: VMerge::None,
-            blocks: vec![DocxCellBlock {
-                md: text.to_string(),
-                plain: text.to_string(),
-                kind,
-                is_table: false,
-            }],
-        }
-    }
+    // ---- Grid render unit tests ----
 
     #[test]
     fn test_docx_expand_row_to_grid_hspan() {
@@ -3241,36 +2848,34 @@ mod tests {
     }
 
     #[test]
-    fn test_docx_render_banner_bold() {
-        // Banner with a Normal paragraph → bold paragraph, not a heading.
+    fn test_docx_render_full_width_banner_is_grid_row() {
+        // A full-width "banner" row is kept as a grid row (empty-filled), not
+        // linearized into a heading or bold paragraph.
         let t = DocxTable {
             grid_width: 3,
-            rows: vec![row(vec![cell("Section Header", 3, VMerge::None)])],
+            rows: vec![
+                row(vec![cell("Section Header", 3, VMerge::None)]),
+                row(vec![
+                    cell("A", 1, VMerge::None),
+                    cell("B", 1, VMerge::None),
+                    cell("C", 1, VMerge::None),
+                ]),
+            ],
             ..Default::default()
         };
         let (md, _plain) = render_docx_table(&t);
-        assert!(md.contains("**Section Header**"), "md: {md}");
-        assert!(!md.contains("# Section Header"), "md: {md}");
-        assert!(!md.contains('|'), "banner must not be a table: {md}");
+        // One GFM table: the banner is the header row, empty-filled.
+        assert!(md.contains("| Section Header |  |  |"), "md: {md}");
+        assert!(md.contains("| A | B | C |"), "md: {md}");
+        // No heading/bold linearization.
+        assert!(!md.contains('#'), "md: {md}");
+        assert!(!md.contains("**"), "md: {md}");
     }
 
     #[test]
-    fn test_docx_render_banner_heading() {
-        let t = DocxTable {
-            grid_width: 3,
-            rows: vec![row(vec![cell_kind(
-                "Section Header",
-                3,
-                ParagraphKind::Heading(2),
-            )])],
-            ..Default::default()
-        };
-        let (md, _plain) = render_docx_table(&t);
-        assert!(md.contains("## Section Header"), "md: {md}");
-    }
-
-    #[test]
-    fn test_docx_render_label_value() {
+    fn test_docx_render_label_value_kept_as_grid_row() {
+        // A narrow-label + wide-value row stays a grid row (empty-filled), not a
+        // `**Label:** value` line.
         let t = DocxTable {
             grid_width: 3,
             rows: vec![row(vec![
@@ -3280,47 +2885,32 @@ mod tests {
             ..Default::default()
         };
         let (md, _plain) = render_docx_table(&t);
-        assert!(md.contains("**Date:** Monday"), "md: {md}");
+        assert!(md.contains("| Date | Monday |  |"), "md: {md}");
+        assert!(!md.contains("**Date:**"), "md: {md}");
     }
 
     #[test]
-    fn test_docx_render_label_value_existing_colon_not_doubled() {
-        let t = DocxTable {
-            grid_width: 3,
-            rows: vec![row(vec![
-                cell("Date:", 1, VMerge::None),
-                cell("Monday", 2, VMerge::None),
-            ])],
-            ..Default::default()
-        };
-        let (md, _plain) = render_docx_table(&t);
-        assert!(md.contains("**Date:** Monday"), "md: {md}");
-        assert!(!md.contains("Date::"), "colon doubled: {md}");
-    }
-
-    #[test]
-    fn test_docx_render_grid_region_full_width() {
-        // A banner over a 3-column data grid: the grid keeps all columns.
+    fn test_docx_render_data_table_spanning_row_keeps_columns() {
+        // A data table with a header row and a spanning row keeps all columns as
+        // one GFM table (the regression the review flagged).
         let t = DocxTable {
             grid_width: 3,
             rows: vec![
-                row(vec![cell("Banner", 3, VMerge::None)]),
                 row(vec![
                     cell("A", 1, VMerge::None),
                     cell("B", 1, VMerge::None),
                     cell("C", 1, VMerge::None),
                 ]),
                 row(vec![
-                    cell("1", 1, VMerge::None),
-                    cell("2", 1, VMerge::None),
-                    cell("3", 1, VMerge::None),
+                    cell("x", 1, VMerge::None),
+                    cell("spans", 2, VMerge::None),
                 ]),
             ],
             ..Default::default()
         };
         let (md, _plain) = render_docx_table(&t);
         assert!(md.contains("| A | B | C |"), "md: {md}");
-        assert!(md.contains("| 1 | 2 | 3 |"), "md: {md}");
+        assert!(md.contains("| x | spans |  |"), "md: {md}");
     }
 
     #[test]
@@ -3348,11 +2938,14 @@ mod tests {
 
     #[test]
     fn test_docx_render_pipe_in_cell_escaped() {
-        // A literal pipe inside a hybrid-grid cell must be escaped by build_table.
+        // A literal pipe inside a grid cell must be escaped by build_table.
         let t = DocxTable {
             grid_width: 2,
             rows: vec![
-                row(vec![cell("Banner", 2, VMerge::None)]),
+                row(vec![
+                    cell("h1", 1, VMerge::None),
+                    cell("h2", 1, VMerge::None),
+                ]),
                 row(vec![
                     cell("a|b", 1, VMerge::None),
                     cell("c", 1, VMerge::None),
@@ -3365,17 +2958,12 @@ mod tests {
     }
 
     #[test]
-    fn test_docx_plain_linearized_flattened() {
-        // Plain text: banner + label/value linearize with NO markers; grid region
-        // stays tab-separated.
+    fn test_docx_plain_grid_tab_separated() {
+        // Plain text for a merged/layout table is tab-separated, empty-filled.
         let t = DocxTable {
             grid_width: 3,
             rows: vec![
                 row(vec![cell("Section", 3, VMerge::None)]),
-                row(vec![
-                    cell("Field", 1, VMerge::None),
-                    cell("Value", 2, VMerge::None),
-                ]),
                 row(vec![
                     cell("A", 1, VMerge::None),
                     cell("B", 1, VMerge::None),
@@ -3386,13 +2974,8 @@ mod tests {
         };
         let (_md, plain) = render_docx_table(&t);
         assert!(plain.contains("Section"), "plain: {plain}");
-        assert!(plain.contains("Field"), "plain: {plain}");
-        assert!(plain.contains("Value"), "plain: {plain}");
-        // No markdown markers in linearized plain text.
-        assert!(!plain.contains("**"), "plain has bold markers: {plain}");
-        assert!(!plain.contains("**Field:**"), "plain: {plain}");
-        // Grid region is tab-separated.
-        assert!(plain.contains("A\tB\tC"), "plain grid not tabbed: {plain}");
+        assert!(!plain.contains("**"), "plain has markers: {plain}");
+        assert!(plain.contains("A\tB\tC"), "plain not tabbed: {plain}");
     }
 
     #[test]
@@ -3415,70 +2998,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(render_docx_table(&t), render_docx_table(&t));
-    }
-
-    #[test]
-    fn test_docx_render_label_value_double_colon_preserved() {
-        // A label ending in more than one colon must not have colons collapsed:
-        // only a single trailing colon is normalized away before re-adding one.
-        let t = DocxTable {
-            grid_width: 3,
-            rows: vec![row(vec![
-                cell("Ratio::", 1, VMerge::None),
-                cell("v", 2, VMerge::None),
-            ])],
-            ..Default::default()
-        };
-        let (md, _) = render_docx_table(&t);
-        assert!(md.contains("**Ratio::** v"), "md: {md}");
-    }
-
-    #[test]
-    fn test_docx_render_banner_heading_not_first_block() {
-        // A banner cell whose heading-styled paragraph is preceded by an empty
-        // paragraph is still promoted to a heading.
-        let t = DocxTable {
-            grid_width: 2,
-            rows: vec![
-                row(vec![DocxCell {
-                    grid_span: 2,
-                    v_merge: VMerge::None,
-                    blocks: vec![
-                        DocxCellBlock {
-                            md: String::new(),
-                            plain: String::new(),
-                            kind: ParagraphKind::Normal,
-                            is_table: false,
-                        },
-                        DocxCellBlock {
-                            md: "Title".to_string(),
-                            plain: "Title".to_string(),
-                            kind: ParagraphKind::Heading(2),
-                            is_table: false,
-                        },
-                    ],
-                }]),
-                row(vec![cell("a", 1, VMerge::None), cell("b", 1, VMerge::None)]),
-            ],
-            ..Default::default()
-        };
-        let (md, _) = render_docx_table(&t);
-        assert!(md.contains("## Title"), "banner not promoted: {md}");
-    }
-
-    #[test]
-    fn test_docx_render_empty_label_not_label_value() {
-        // A [empty label, wide value] row must not render a bare `**:**` artifact.
-        let t = DocxTable {
-            grid_width: 3,
-            rows: vec![row(vec![
-                cell("", 1, VMerge::None),
-                cell("wide", 2, VMerge::None),
-            ])],
-            ..Default::default()
-        };
-        let (md, _) = render_docx_table(&t);
-        assert!(!md.contains("**:**"), "empty-label artifact: {md}");
     }
 
     #[test]

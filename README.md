@@ -119,20 +119,26 @@ Data Overview
 
 ### Tables and merged cells
 
-Plain, uniform tables become pipe-delimited Markdown tables. Tables that use
-merged cells (`gridSpan`/`vMerge` in DOCX, `colspan`/`rowspan` in HTML) — often
-used for page layout rather than tabular data — are rendered with a hybrid
-strategy that preserves all content instead of collapsing columns:
+Every table — plain, merged, or used for page layout — becomes a single
+pipe-delimited Markdown table of the table's true column count. Merged cells
+(`gridSpan`/`vMerge` in DOCX, `colspan`/`rowspan` in HTML) are handled so no
+content is lost:
 
-- a full-width row (a single cell spanning every column) becomes a heading when
-  it is heading-styled, otherwise a bold paragraph;
-- a narrow-label + wide-value row becomes `**Label:** value`;
-- genuinely tabular regions (rows whose cells tile the full width) stay
-  pipe-delimited Markdown tables, with horizontal spans empty-filled and
-  vertical-merge continuation cells left blank;
-- nested tables are rendered in place as their own Markdown tables.
+- a horizontally spanned cell puts its text in the first column it covers and
+  leaves the spanned-over columns empty (empty-fill);
+- a vertically merged (continuation) cell is left blank;
+- a full-width row (a single cell spanning every column) is kept as a normal
+  grid row, empty-filled to the table width — it is **not** turned into a heading
+  or a `**Label:** value` line.
 
-PPTX tables are always rendered as Markdown tables; merged cells keep the
+This is deliberately uniform: keeping a merged/layout table as one table (rather
+than splitting it into headings and field lines) gives downstream consumers,
+especially LLMs, a consistent structure. The one exception is a table that
+contains a **nested table** — a nested table cannot live inside a single Markdown
+cell, so such a table is linearized and each cell's text and nested table are
+emitted as standalone blocks.
+
+PPTX tables are likewise rendered as Markdown tables; merged cells keep the
 correct column count and the spanning cell's text is not duplicated.
 
 ## Installation

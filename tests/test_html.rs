@@ -99,13 +99,13 @@ fn test_html_convert_bytes_direct() {
     assert!(result.markdown.contains("World"));
 }
 
-/// Integration test: a colspan/rowspan layout table converts via the hybrid path.
+/// Integration test: a colspan/rowspan layout table renders as one GFM grid.
 ///
 /// Mirrors the structure of a layout table (full-width banner, label/value rows,
 /// and a data grid) that previously collapsed to a single column. All columns
-/// must survive and the layout rows must linearize.
+/// must survive as one empty-filled grid (no heading / `**Label:**` promotion).
 #[test]
-fn test_html_colspan_layout_hybrid() {
+fn test_html_colspan_layout_grid() {
     let input = br#"<html><body><table>
         <tr><td colspan="3"><h2>Section Title</h2></td></tr>
         <tr><td>Field</td><td colspan="2">Value</td></tr>
@@ -115,13 +115,13 @@ fn test_html_colspan_layout_hybrid() {
     let result = anytomd::convert_bytes(input, "html", &ConversionOptions::default()).unwrap();
 
     assert!(
-        result.markdown.contains("## Section Title"),
-        "banner not a heading: {}",
+        result.markdown.contains("| Section Title |  |  |"),
+        "banner not an empty-filled header: {}",
         result.markdown
     );
     assert!(
-        result.markdown.contains("**Field:** Value"),
-        "label/value not linearized: {}",
+        result.markdown.contains("| Field | Value |  |"),
+        "label/value not a grid row: {}",
         result.markdown
     );
     assert!(
@@ -132,6 +132,17 @@ fn test_html_colspan_layout_hybrid() {
     assert!(
         result.markdown.contains("| 1 | 2 | 3 |"),
         "grid data missing: {}",
+        result.markdown
+    );
+    // No heading / bold linearization.
+    assert!(
+        !result.markdown.contains("## Section"),
+        "md: {}",
+        result.markdown
+    );
+    assert!(
+        !result.markdown.contains("**Field:**"),
+        "md: {}",
         result.markdown
     );
 }
@@ -170,5 +181,32 @@ fn test_html_colspan_dos_bounded_end_to_end() {
         result.markdown.len() < 100_000,
         "not bounded: {} bytes",
         result.markdown.len()
+    );
+}
+
+/// Regression (review should-fix): a genuine data table with one spanning row
+/// must keep all columns as a single GFM table, not fragment into a header-only
+/// table plus a relabeled `**x:** spans` line.
+#[test]
+fn test_html_data_table_spanning_row_keeps_columns() {
+    let input = br#"<html><body><table>
+        <tr><th>A</th><th>B</th><th>C</th></tr>
+        <tr><td>x</td><td colspan="2">spans</td></tr>
+    </table></body></html>"#;
+    let result = anytomd::convert_bytes(input, "html", &ConversionOptions::default()).unwrap();
+    assert!(
+        result.markdown.contains("| A | B | C |"),
+        "md: {}",
+        result.markdown
+    );
+    assert!(
+        result.markdown.contains("| x | spans |  |"),
+        "md: {}",
+        result.markdown
+    );
+    assert!(
+        !result.markdown.contains("**x:**"),
+        "row was relabeled: {}",
+        result.markdown
     );
 }

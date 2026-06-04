@@ -322,6 +322,11 @@ fn parse_slide(xml: &str) -> (Vec<ShapeContent>, Vec<ConversionWarning>) {
                         "tc" if in_table_cell => {
                             // Merge-continuation placeholders render empty so the
                             // spanning cell's text is not duplicated across columns.
+                            // (PowerPoint echoes the spanning cell's text into the
+                            // hMerge/vMerge placeholder, so blanking it is what
+                            // dedups; this is preferred over recovering the rare
+                            // orphan-with-text case, which cannot be distinguished
+                            // from that echo by text presence alone.)
                             if current_cell_is_merge {
                                 current_row.push(String::new());
                             } else {
