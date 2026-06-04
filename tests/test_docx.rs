@@ -506,6 +506,25 @@ fn test_docx_long_form_gridspan_parsed() {
     );
 }
 
+/// Regression (review finding): a row with more cells than the declared
+/// `<w:tblGrid>` width must keep every cell. The grid count is a floor, not a
+/// ceiling, so trailing cells are no longer silently dropped.
+#[test]
+fn test_docx_row_wider_than_tblgrid_keeps_all_cells() {
+    let body = concat!(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="1"/><w:gridCol w:w="1"/></w:tblGrid>"#,
+        r#"<w:tr><w:tc><w:p><w:r><w:t>H1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>H2</w:t></w:r></w:p></w:tc></w:tr>"#,
+        r#"<w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>C</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+    );
+    let data = build_docx_from_body(body, None);
+    let result = anytomd::convert_bytes(&data, "docx", &ConversionOptions::default()).unwrap();
+    assert!(
+        result.markdown.contains("| A | B | C |"),
+        "trailing cell dropped: {}",
+        result.markdown
+    );
+}
+
 /// Regression (review finding): an orphan vMerge continuation cell that carries
 /// text (no matching restart) must not silently drop its content.
 #[test]
@@ -590,4 +609,92 @@ fn test_docx_huge_gridspan_bounded() {
         result.markdown.len()
     );
     assert!(result.markdown.contains('X'));
+}
+
+/// DoS guard (review finding): a table with more rows than the cell cap allows
+/// is truncated, and the dropped rows are observable via a ResourceLimitReached
+/// warning (best-effort: never silently drop content).
+#[test]
+fn test_docx_table_rows_capped_with_warning() {
+    use anytomd::WarningCode;
+
+    // Wide grid (1000 cols) ⇒ max_rows = MAX_TABLE_CELLS / 1000 = 100. Emit more
+    // than that so truncation triggers without building a huge document.
+    let cols = "<w:gridCol w:w=\"1\"/>".repeat(1000);
+    let mut body = format!("<w:tbl><w:tblGrid>{cols}</w:tblGrid>");
+    // 150 rows, each a single full-width gridSpan banner (one cell per row).
+    for i in 0..150 {
+        body.push_str(&format!(
+            r#"<w:tr><w:tc><w:tcPr><w:gridSpan w:val="1000"/></w:tcPr><w:p><w:r><w:t>row{i}</w:t></w:r></w:p></w:tc></w:tr>"#
+        ));
+    }
+    body.push_str("</w:tbl>");
+
+    let data = build_docx_from_body(&body, None);
+    let result = anytomd::convert_bytes(&data, "docx", &ConversionOptions::default()).unwrap();
+
+    // Truncated: an early row survives, a late row (beyond max_rows=100) does not.
+    assert!(result.markdown.contains("row0"), "early row missing");
+    assert!(
+        !result.markdown.contains("row149"),
+        "table not truncated: {}",
+        result.markdown.len()
+    );
+    // Dropping rows is observable.
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.code == WarningCode::ResourceLimitReached),
+        "expected ResourceLimitReached warning, got: {:?}",
+        result.warnings
+    );
+}
+
+/// Regression (review finding): a table that contains a nested table, followed
+/// by a paragraph, must have exactly one blank line between them — the same
+/// spacing as a normal table and the HTML linearize path (no extra blank line).
+#[test]
+fn test_docx_nested_table_one_blank_line_before_following_paragraph() {
+    let inner =
+        r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>inner</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+    let body = format!(
+        concat!(
+            r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>before</w:t></w:r></w:p>{inner}</w:tc></w:tr></w:tbl>"#,
+            r#"<w:p><w:r><w:t>After paragraph.</w:t></w:r></w:p>"#,
+        ),
+        inner = inner
+    );
+    let data = build_docx_from_body(&body, None);
+    let result = anytomd::convert_bytes(&data, "docx", &ConversionOptions::default()).unwrap();
+
+    // The inner one-column table renders as `| inner |` / `|---|` (header +
+    // separator, no data rows). Assert the following paragraph is separated from
+    // the table's last line (`|---|`) by exactly one blank line (\n\n), not two.
+    let md = &result.markdown;
+    let after_idx = md.find("After paragraph.").expect("paragraph missing");
+    let before = &md[..after_idx];
+    assert!(before.contains("| inner |"), "inner table missing: {md}");
+    assert!(
+        before.ends_with("|---|\n\n"),
+        "expected exactly one blank line before the paragraph, before={before:?}"
+    );
+    assert!(
+        !before.ends_with("|---|\n\n\n"),
+        "extra blank line after nested-table table, before={before:?}"
+    );
+
+    // Plain stream: exactly one blank line as well.
+    let p = &result.plain_text;
+    let pa = p.find("After paragraph.").expect("plain paragraph missing");
+    assert!(
+        p[..pa].ends_with("inner\n\n"),
+        "expected one blank line in plain, was:\n{:?}",
+        &p[..pa]
+    );
+    assert!(
+        !p[..pa].ends_with("inner\n\n\n"),
+        "extra blank line in plain, was:\n{:?}",
+        &p[..pa]
+    );
 }

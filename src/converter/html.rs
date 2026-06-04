@@ -4,7 +4,9 @@
 //! to produce Markdown. Supports headings, paragraphs, tables, lists, links,
 //! blockquotes, code blocks, bold/italic, and images.
 
-use crate::converter::{ConversionOptions, ConversionResult, Converter};
+use crate::converter::{
+    ConversionOptions, ConversionResult, ConversionWarning, Converter, WarningCode,
+};
 use crate::error::ConvertError;
 use crate::markdown;
 
@@ -56,12 +58,13 @@ impl Converter for HtmlConverter {
         let document = Html::parse_document(text);
 
         let title = extract_title(&document);
-        let (md, plain) = walk_dom(&document);
+        let (md, plain, warnings) = walk_dom(&document);
 
         Ok(ConversionResult {
             markdown: md,
             plain_text: plain,
             title,
+            warnings,
             ..Default::default()
         })
     }
@@ -105,6 +108,10 @@ struct WalkerState {
     /// Stack of table collectors; the top is the table currently being walked.
     /// A nested `<table>` inside a cell pushes a new frame.
     table_stack: Vec<TableCollector>,
+    /// Recoverable issues encountered while walking (e.g. a table truncated by a
+    /// resource cap). Surfaced in `ConversionResult.warnings` so best-effort
+    /// truncation is observable rather than silent.
+    warnings: Vec<ConversionWarning>,
 }
 
 struct ListContext {
@@ -123,27 +130,83 @@ struct PendingLink {
     start_pos: usize,
 }
 
-/// One buffered HTML table cell with span info and content.
+/// One ordered piece of a table cell's content.
+///
+/// A cell may interleave text and nested tables (e.g. `text<table>..</table>more`).
+/// Storing the pieces in document order — instead of one text string plus a
+/// separate nested-table string — preserves their relative position when the
+/// containing table is linearized. (Mirrors the DOCX cell-block model.)
+#[derive(Debug, Clone)]
+enum CellSegment {
+    /// Accumulated text run.
+    Text(String),
+    /// A fully-rendered nested table: `(markdown, plain_text)`. A nested table
+    /// cannot live inside a single GFM cell, so it is emitted as a standalone
+    /// block when the containing table is linearized.
+    Table {
+        /// Rendered markdown of the nested table.
+        md: String,
+        /// Plain-text form of the nested table.
+        plain: String,
+    },
+}
+
+/// One buffered HTML table cell with span info and ordered content segments.
 #[derive(Debug, Clone, Default)]
 struct HtmlCell {
     /// Columns this cell spans (`colspan`), always at least 1.
     colspan: usize,
     /// Rows this cell spans (`rowspan`), always at least 1.
     rowspan: usize,
-    /// Accumulated cell text.
-    content: String,
-    /// Rendered markdown of a nested table inside this cell, if any. Kept
-    /// separate from `content` so it is emitted as a standalone block rather than
-    /// escaped into a single grid cell.
-    nested_md: String,
-    /// Plain-text form of the nested table, paired with `nested_md`.
-    nested_plain: String,
+    /// Content in document order: text runs and nested tables interleaved.
+    segments: Vec<CellSegment>,
 }
 
 impl HtmlCell {
     /// Whether this cell contains a rendered nested table.
     fn has_nested_table(&self) -> bool {
-        !self.nested_md.is_empty()
+        self.segments
+            .iter()
+            .any(|s| matches!(s, CellSegment::Table { .. }))
+    }
+
+    /// Append text to the cell, extending the trailing `Text` segment if the last
+    /// segment is text, otherwise starting a new one. Keeps consecutive characters
+    /// in one segment so grid cells join cleanly.
+    fn push_text(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        if let Some(CellSegment::Text(t)) = self.segments.last_mut() {
+            t.push_str(s);
+        } else {
+            self.segments.push(CellSegment::Text(s.to_string()));
+        }
+    }
+
+    /// Append a single space to the trailing text segment (used to separate two
+    /// block elements, e.g. two headings, inside one cell) only when the cell
+    /// already ends with non-whitespace text. Never starts a new segment and
+    /// never inserts space before a nested table.
+    fn push_separator_space(&mut self) {
+        if let Some(CellSegment::Text(t)) = self.segments.last_mut()
+            && !t.is_empty()
+            && !t.ends_with(char::is_whitespace)
+        {
+            t.push(' ');
+        }
+    }
+
+    /// Join all text segments into one string (nested tables omitted). Used for
+    /// the normal grid path where a cell becomes a single GFM cell. Trimmed.
+    fn joined_text(&self) -> String {
+        let mut s = String::new();
+        for seg in &self.segments {
+            if let CellSegment::Text(t) = seg {
+                s.push_str(t);
+            }
+        }
+        s.trim().to_string()
     }
 }
 
@@ -184,6 +247,7 @@ impl WalkerState {
             pending_heading: None,
             pending_link: None,
             table_stack: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -293,7 +357,7 @@ impl WalkerState {
 
 // ---- DOM walker ----
 
-fn walk_dom(document: &Html) -> (String, String) {
+fn walk_dom(document: &Html) -> (String, String, Vec<ConversionWarning>) {
     let mut state = WalkerState::new();
 
     for edge in document.root_element().traverse() {
@@ -314,7 +378,7 @@ fn walk_dom(document: &Html) -> (String, String) {
         plain + "\n"
     };
 
-    (md, plain)
+    (md, plain, state.warnings)
 }
 
 // ---- Element handlers (open) ----
@@ -338,10 +402,9 @@ fn handle_open(state: &mut WalkerState, node: &ego_tree::NodeRef<Node>) {
                     if let Some(tc) = state.table_stack.last_mut()
                         && tc.in_cell
                     {
-                        let cur = &mut tc.current_cell.content;
-                        if !cur.is_empty() && !cur.ends_with(char::is_whitespace) {
-                            cur.push(' ');
-                        }
+                        // Separate this heading's text from preceding cell text so
+                        // two headings in one cell do not mash together.
+                        tc.current_cell.push_separator_space();
                     }
                     if !state.in_table_cell() {
                         state.both_ensure_blank_line();
@@ -449,6 +512,8 @@ fn handle_open(state: &mut WalkerState, node: &ego_tree::NodeRef<Node>) {
                 "tr" => {
                     if let Some(tc) = state.table_stack.last_mut() {
                         tc.current_row = HtmlRow::default();
+                        // Read back in `render_table` to pick the GFM header row,
+                        // so a `<thead>` that does not appear first still wins.
                         tc.current_row.is_header_row = tc.in_header;
                     }
                 }
@@ -611,23 +676,19 @@ fn handle_close(state: &mut WalkerState, node: &ego_tree::NodeRef<Node>) {
             }
             "table" => {
                 if let Some(tc) = state.table_stack.pop() {
-                    let table_md = render_table(&tc, false);
-                    let table_plain = render_table(&tc, true);
+                    let table_md = render_table(&tc, false, &mut state.warnings);
+                    let table_plain = render_table(&tc, true, &mut Vec::new());
                     if state.table_stack.last().is_some_and(|p| p.in_cell) {
-                        // Nested table: stash its rendered output on the enclosing
-                        // cell (kept apart from the cell's text). The cell's row is
-                        // then linearized so the nested table renders as a block
-                        // instead of being escaped into a single grid cell.
+                        // Nested table: append it as a Table segment so it keeps its
+                        // document position relative to any text on either side. The
+                        // containing table is then linearized, emitting the nested
+                        // table as a standalone block rather than escaping it into a
+                        // single grid cell.
                         let parent = state.table_stack.last_mut().unwrap();
-                        if !parent.current_cell.nested_md.is_empty() {
-                            parent.current_cell.nested_md.push('\n');
-                            parent.current_cell.nested_plain.push('\n');
-                        }
-                        parent.current_cell.nested_md.push_str(table_md.trim_end());
-                        parent
-                            .current_cell
-                            .nested_plain
-                            .push_str(table_plain.trim_end());
+                        parent.current_cell.segments.push(CellSegment::Table {
+                            md: table_md.trim_end().to_string(),
+                            plain: table_plain.trim_end().to_string(),
+                        });
                     } else {
                         state.push_str(&table_md);
                         state.plain_push_str(&table_plain);
@@ -647,8 +708,10 @@ fn handle_close(state: &mut WalkerState, node: &ego_tree::NodeRef<Node>) {
             }
             "th" | "td" => {
                 if let Some(tc) = state.table_stack.last_mut() {
-                    let mut cell = std::mem::take(&mut tc.current_cell);
-                    cell.content = cell.content.trim().to_string();
+                    // Trimming now happens at read time (`joined_text` / the
+                    // linearize branch), matching how DOCX trims per-block; there is
+                    // no longer a single `content` field to trim here.
+                    let cell = std::mem::take(&mut tc.current_cell);
                     tc.current_row.cells.push(cell);
                     tc.in_cell = false;
                 }
@@ -671,10 +734,12 @@ fn handle_text(state: &mut WalkerState, text: &scraper::node::Text) {
 
     let raw = text.text.as_ref();
 
-    // Inside a table cell: accumulate into the cell buffer (shared for both outputs)
+    // Inside a table cell: accumulate into the cell's ordered segments (shared for
+    // both outputs). Extends the trailing text segment so text on either side of a
+    // nested table keeps its document position relative to the table.
     if let Some(tc) = state.table_stack.last_mut() {
         if tc.in_cell {
-            tc.current_cell.content.push_str(raw);
+            tc.current_cell.push_text(raw);
         }
         // Text outside cells but inside table (e.g. whitespace between tags) — ignore
         return;
@@ -791,7 +856,9 @@ fn collapse_whitespace(s: &str) -> String {
 /// number of materialized cells is capped at `MAX_TABLE_CELLS`. Both caps are
 /// no-ops for realistic tables and only truncate hostile inputs (e.g. a single
 /// `rowspan`x`colspan` cell that would otherwise expand quadratically).
-fn normalize_html_rowspans(rows: &[HtmlRow]) -> Vec<HtmlRow> {
+/// Returns the normalized rows and `true` if the `MAX_TABLE_CELLS` cap dropped
+/// cells (so the caller can emit a truncation warning).
+fn normalize_html_rowspans(rows: &[HtmlRow]) -> (Vec<HtmlRow>, bool) {
     // Provisional grid width: the widest row by summed colspan, capped so an
     // extreme colspan cannot drive unbounded per-column allocation. This is the
     // same quantity `html_grid_width` derives from the *normalized* rows, but
@@ -818,7 +885,7 @@ fn normalize_html_rowspans(rows: &[HtmlRow]) -> Vec<HtmlRow> {
                 is_header_row: row.is_header_row,
             });
         }
-        return out;
+        return (out, false);
     }
 
     // Carried spans, indexed by column: remaining rows still covered at `col`.
@@ -895,17 +962,18 @@ fn normalize_html_rowspans(rows: &[HtmlRow]) -> Vec<HtmlRow> {
 
         if total_cells >= MAX_TABLE_CELLS {
             // Truncate the remaining rows: emit them empty so downstream row
-            // count stays consistent without further allocation.
+            // count stays consistent without further allocation. This drops cell
+            // content, so report it to the caller.
             for r in &rows[out.len()..] {
                 out.push(HtmlRow {
                     cells: Vec::new(),
                     is_header_row: r.is_header_row,
                 });
             }
-            break;
+            return (out, true);
         }
     }
-    out
+    (out, false)
 }
 
 /// Authoritative grid width of an HTML table: the max over rows of summed colspan.
@@ -934,7 +1002,7 @@ fn expand_html_row(row: &HtmlRow, grid_width: usize) -> Vec<String> {
     let mut cols: Vec<String> = Vec::with_capacity(grid_width);
     for c in &row.cells {
         let span = c.colspan.max(1);
-        cols.push(c.content.trim().to_string());
+        cols.push(c.joined_text());
         for _ in 1..span {
             cols.push(String::new());
         }
@@ -965,16 +1033,24 @@ fn render_html_grid(rows: &[&HtmlRow], grid_width: usize, plain: bool) -> String
 ///
 /// Every table — uniform, merged, or layout — renders as a single GFM table of
 /// the authoritative grid width: horizontal spans are empty-filled, vertical
-/// spans (`rowspan`) are materialized as blank placeholder cells, and the first
-/// row is the header. This is deliberately uniform: a merged/layout table is kept
-/// as one table rather than being split into headings and `**Label:** value`
-/// lines, so structure stays consistent for downstream (LLM) consumers.
+/// spans (`rowspan`) are materialized as blank placeholder cells, and the header
+/// is the first row marked `is_header_row` (from `<thead>`) if any, else the first
+/// row. This is deliberately uniform: a merged/layout table is kept as one table
+/// rather than being split into headings and `**Label:** value` lines, so
+/// structure stays consistent for downstream (LLM) consumers.
 ///
 /// The one exception is a table that contains a nested table: a nested table
-/// cannot live inside a single GFM cell, so such a table is linearized — each
-/// cell's text and any nested table are emitted as standalone blocks.
-fn render_table(tc: &TableCollector, plain: bool) -> String {
-    let rows = normalize_html_rowspans(&tc.rows);
+/// cannot live inside a single GFM cell, so such a table is linearized as a WHOLE
+/// (per-table, not per-row) — each cell's text and any nested table are emitted as
+/// standalone blocks in document order. This whole-table linearization is
+/// intentional (consistency over prettiness): mixing a grid for some rows and
+/// blocks for others would be less predictable than one uniform block.
+///
+/// `warnings` collects best-effort truncations (rows/cells dropped by a resource
+/// cap) so they are observable rather than silent. Callers pass a throwaway sink
+/// for the plain-text render so identical truncations are not counted twice.
+fn render_table(tc: &TableCollector, plain: bool, warnings: &mut Vec<ConversionWarning>) -> String {
+    let (rows, cells_truncated) = normalize_html_rowspans(&tc.rows);
     if rows.is_empty() {
         return String::new();
     }
@@ -983,27 +1059,56 @@ fn render_table(tc: &TableCollector, plain: bool) -> String {
         return String::new();
     }
 
+    // #2: the grid width is capped at MAX_TABLE_COLS, so a row whose real cells sum
+    // to more than that has columns dropped. Detect it by comparing the rendered
+    // width against the widest row's raw summed colspan.
+    let raw_width = tc
+        .rows
+        .iter()
+        .map(|r| r.cells.iter().map(|c| c.colspan.max(1)).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    let width_capped = raw_width > grid_width;
+
     // A nested table cannot be a grid cell: linearize the whole table, emitting
-    // each cell's text and any nested table as standalone blocks in order.
+    // each cell's text and any nested table as standalone blocks in document
+    // order. Iterating `segments` preserves text-before / text-after position
+    // around a nested table; successive nested tables are separated by a blank
+    // line so GFM does not fuse them.
     if rows.iter().any(html_row_has_nested_table) {
         let mut out = String::new();
         for row in &rows {
             for c in &row.cells {
-                let text = c.content.trim();
-                if !text.is_empty() {
-                    out.push_str(text);
-                    out.push('\n');
-                    if !plain {
-                        out.push('\n');
-                    }
-                }
-                if c.has_nested_table() {
-                    if plain {
-                        out.push_str(c.nested_plain.trim_end());
-                        out.push('\n');
-                    } else {
-                        out.push_str(c.nested_md.trim_end());
-                        out.push_str("\n\n");
+                for seg in &c.segments {
+                    match seg {
+                        CellSegment::Text(t) => {
+                            let text = t.trim();
+                            if !text.is_empty() {
+                                out.push_str(text);
+                                out.push('\n');
+                                if !plain {
+                                    out.push('\n');
+                                }
+                            }
+                        }
+                        CellSegment::Table { md, plain: tp } => {
+                            // Guarantee a blank line before the table so adjacent
+                            // blocks (text or another nested table) never fuse.
+                            if !plain && !out.is_empty() && !out.ends_with("\n\n") {
+                                if out.ends_with('\n') {
+                                    out.push('\n');
+                                } else {
+                                    out.push_str("\n\n");
+                                }
+                            }
+                            if plain {
+                                out.push_str(tp.trim_end());
+                                out.push('\n');
+                            } else {
+                                out.push_str(md.trim_end());
+                                out.push_str("\n\n");
+                            }
+                        }
                     }
                 }
             }
@@ -1011,16 +1116,79 @@ fn render_table(tc: &TableCollector, plain: bool) -> String {
         if plain {
             out.push('\n');
         }
+        if !plain {
+            push_table_truncation_warnings(warnings, cells_truncated, width_capped, false);
+        }
         return out;
     }
 
-    // Common case: one empty-filled GFM grid over every row (row 0 is the header).
+    // Common case: one empty-filled GFM grid. The header is the first row marked
+    // `is_header_row` (a `<thead>` row, which may not appear first in the source,
+    // e.g. `<tbody>` before `<thead>`); all OTHER rows render as the body in their
+    // original order. Falls back to row 0 as the header when no row is marked.
+    let header_idx = rows.iter().position(|r| r.is_header_row).unwrap_or(0);
+
     // Bound the rendered area (rows x grid_width) at MAX_TABLE_CELLS: since every
     // cell is escaped and emitted, an extreme grid would otherwise produce
     // gigabytes of markdown. Excess rows are dropped (best-effort truncation).
     let max_rows = (MAX_TABLE_CELLS / grid_width).max(1);
-    let row_refs: Vec<&HtmlRow> = rows.iter().take(max_rows).collect();
-    render_html_grid(&row_refs, grid_width, plain)
+    let rows_dropped = rows.len() > max_rows;
+
+    // Order the rows for rendering: header first, then every other row in source
+    // order. Then apply the row cap to the ordered list.
+    let mut ordered: Vec<&HtmlRow> = Vec::with_capacity(rows.len());
+    ordered.push(&rows[header_idx]);
+    for (i, r) in rows.iter().enumerate() {
+        if i != header_idx {
+            ordered.push(r);
+        }
+    }
+    ordered.truncate(max_rows);
+
+    if !plain {
+        push_table_truncation_warnings(warnings, cells_truncated, width_capped, rows_dropped);
+    }
+
+    render_html_grid(&ordered, grid_width, plain)
+}
+
+/// Append one `ResourceLimitReached` warning per distinct table truncation.
+///
+/// Best-effort conversion truncates rather than failing on extreme tables; each
+/// dropped-content case appends a structured warning so the loss is observable.
+fn push_table_truncation_warnings(
+    warnings: &mut Vec<ConversionWarning>,
+    cells_truncated: bool,
+    width_capped: bool,
+    rows_dropped: bool,
+) {
+    if cells_truncated {
+        warnings.push(ConversionWarning {
+            code: WarningCode::ResourceLimitReached,
+            message: format!(
+                "table exceeded the {MAX_TABLE_CELLS}-cell limit; trailing rows were truncated"
+            ),
+            location: None,
+        });
+    }
+    if width_capped {
+        warnings.push(ConversionWarning {
+            code: WarningCode::ResourceLimitReached,
+            message: format!(
+                "table row exceeded the {MAX_TABLE_COLS}-column limit; extra columns were dropped"
+            ),
+            location: None,
+        });
+    }
+    if rows_dropped {
+        warnings.push(ConversionWarning {
+            code: WarningCode::ResourceLimitReached,
+            message: format!(
+                "table exceeded the {MAX_TABLE_CELLS}-cell render limit; excess rows were dropped"
+            ),
+            location: None,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1775,5 +1943,228 @@ mod tests {
         assert!(result.markdown.contains("Unclosed paragraph"));
         assert!(result.markdown.contains("Another"));
         assert!(result.markdown.contains("Bold without close"));
+    }
+
+    // ---- Table review-follow-up tests ----
+
+    #[test]
+    fn test_html_thead_after_tbody_is_header() {
+        // Legal HTML: a <tbody> row may appear before the <thead> row. The GFM
+        // header must be the <thead> row, not whichever row came first.
+        let html = r#"<table><tbody><tr><td>d1</td><td>d2</td></tr></tbody><thead><tr><th>H1</th><th>H2</th></tr></thead></table>"#;
+        let result = convert_html(html);
+        // Header row (with separator immediately after) must be the thead row.
+        assert!(
+            result.markdown.contains("| H1 | H2 |\n|---|---|"),
+            "thead row not used as header: {}",
+            result.markdown
+        );
+        // The tbody row is the body, below the separator.
+        assert!(
+            result.markdown.contains("| d1 | d2 |"),
+            "data row missing: {}",
+            result.markdown
+        );
+        // Header must come before data.
+        let h = result.markdown.find("H1").unwrap();
+        let d = result.markdown.find("d1").unwrap();
+        assert!(h < d, "header not above body: {}", result.markdown);
+    }
+
+    #[test]
+    fn test_html_multi_row_thead_first_is_header_rest_body() {
+        // A two-row <thead>: only the FIRST header row can be the GFM header; the
+        // second header row must appear as the first body row (not dropped, not
+        // promoted), followed by the tbody row. Nothing is lost.
+        let html = r#"<table><thead><tr><th>H1a</th><th>H1b</th></tr><tr><th>H2a</th><th>H2b</th></tr></thead><tbody><tr><td>d1</td><td>d2</td></tr></tbody></table>"#;
+        let result = convert_html(html);
+        // First thead row is the header.
+        assert!(
+            result.markdown.contains("| H1a | H1b |\n|---|---|"),
+            "first header row not the GFM header: {}",
+            result.markdown
+        );
+        // Nothing lost.
+        for needle in ["H1a", "H1b", "H2a", "H2b", "d1", "d2"] {
+            assert!(
+                result.markdown.contains(needle),
+                "missing {needle}: {}",
+                result.markdown
+            );
+        }
+        // Body order: second header row, then the tbody row.
+        let h2 = result.markdown.find("H2a").unwrap();
+        let d1 = result.markdown.find("d1").unwrap();
+        assert!(
+            h2 < d1,
+            "second header row not before tbody row: {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_html_nested_table_text_order_preserved() {
+        // Text before AND after a nested table in one cell must keep document order
+        // (outer, then the inner table, then after) and must NOT be glued
+        // ("outerafter").
+        let html = r#"<table><tr><td>outer<table><tr><td>x</td><td>y</td></tr></table>after</td><td>z</td></tr></table>"#;
+        let result = convert_html(html);
+        // The inner table is a standalone GFM block.
+        assert!(
+            result.markdown.contains("| x | y |"),
+            "inner table not a standalone block: {}",
+            result.markdown
+        );
+        // Not glued.
+        assert!(
+            !result.markdown.contains("outerafter"),
+            "outer and after were glued: {}",
+            result.markdown
+        );
+        // Source order: outer < inner table < after.
+        let outer = result.markdown.find("outer").unwrap();
+        let inner = result.markdown.find("| x | y |").unwrap();
+        let after = result.markdown.find("after").unwrap();
+        assert!(
+            outer < inner && inner < after,
+            "document order not preserved: {}",
+            result.markdown
+        );
+        // Plain text keeps order too and leaks no pipes.
+        let p_outer = result.plain_text.find("outer").unwrap();
+        let p_after = result.plain_text.find("after").unwrap();
+        assert!(
+            p_outer < p_after,
+            "plain order wrong: {:?}",
+            result.plain_text
+        );
+        assert!(
+            !result.plain_text.contains('|'),
+            "plain leaked pipes: {:?}",
+            result.plain_text
+        );
+    }
+
+    #[test]
+    fn test_html_sibling_nested_tables_not_fused() {
+        // Two nested tables in one cell must render as two separate GFM tables,
+        // separated by a blank line so GFM does not fuse them into one.
+        let html = r#"<table><tr><td><table><tr><td>a1</td><td>a2</td></tr></table><table><tr><td>b1</td><td>b2</td></tr></table></td><td>z</td></tr></table>"#;
+        let result = convert_html(html);
+        assert!(
+            result.markdown.contains("| a1 | a2 |"),
+            "first inner table missing: {}",
+            result.markdown
+        );
+        assert!(
+            result.markdown.contains("| b1 | b2 |"),
+            "second inner table missing: {}",
+            result.markdown
+        );
+        // A blank line must separate the two tables. Each single-row inner table
+        // renders as a header row plus a `|---|---|` separator (no data rows), so
+        // the boundary is the first table's separator, a blank line, then the
+        // second table's header — they are not fused into one GFM table.
+        assert!(
+            result.markdown.contains("|---|---|\n\n| b1 | b2 |"),
+            "sibling nested tables fused (no blank line between): {}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_html_oversized_table_rows_dropped_warns() {
+        // A table with far more cells than MAX_TABLE_CELLS (here: a wide grid with
+        // many rows) must drop excess rows AND record a ResourceLimitReached
+        // warning so the truncation is observable, not silent.
+        let cols = 1000usize;
+        let rows = 200usize; // cols * rows = 200_000 > MAX_TABLE_CELLS (100_000)
+        let mut html = String::from("<table>");
+        for _ in 0..rows {
+            html.push_str("<tr>");
+            for c in 0..cols {
+                html.push_str("<td>");
+                html.push_str(&c.to_string());
+                html.push_str("</td>");
+            }
+            html.push_str("</tr>");
+        }
+        html.push_str("</table>");
+        let result = convert_html(&html);
+        assert!(
+            !result.warnings.is_empty(),
+            "no warning for truncated oversized table"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::ResourceLimitReached),
+            "warning code not ResourceLimitReached: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn test_html_rowspan_colspan_product_truncation_warns() {
+        // The rowspan x colspan product cap in normalize_html_rowspans drops
+        // trailing rows' cells; that truncation must surface a warning.
+        let n = 4096;
+        let mut html = String::from("<table><tr>");
+        html.push_str(&format!(r#"<td rowspan="{n}" colspan="{n}">RC</td>"#));
+        html.push_str("</tr>");
+        for _ in 1..n {
+            html.push_str("<tr></tr>");
+        }
+        html.push_str("</table>");
+        let result = convert_html(&html);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::ResourceLimitReached),
+            "no ResourceLimitReached warning for product-capped table: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn test_html_overwide_row_columns_dropped_warns() {
+        // A row whose real cells sum past MAX_TABLE_COLS (4096) is clipped by the
+        // width cap, dropping trailing real cells; that loss must surface a
+        // warning (#2). Here the first cell spans the whole cap, so the second
+        // real cell ("dropped") is truncated away.
+        let cap = 4096;
+        let html = format!(
+            r#"<table><tr><td colspan="{cap}">wide</td><td>dropped</td></tr><tr><td>a</td><td>b</td></tr></table>"#
+        );
+        let result = convert_html(&html);
+        // The trailing real cell is gone (width-clipped).
+        assert!(
+            !result.markdown.contains("dropped"),
+            "trailing cell unexpectedly survived: {}",
+            &result.markdown[..result.markdown.len().min(200)]
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::ResourceLimitReached),
+            "no ResourceLimitReached warning for over-width table: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn test_html_normal_table_no_warnings() {
+        // A realistic table must produce NO warnings (truncation warnings only fire
+        // on resource-cap hits).
+        let html = r#"<table><thead><tr><th>A</th><th>B</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table>"#;
+        let result = convert_html(html);
+        assert!(
+            result.warnings.is_empty(),
+            "unexpected warnings on a normal table: {:?}",
+            result.warnings
+        );
     }
 }

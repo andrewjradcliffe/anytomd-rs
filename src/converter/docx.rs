@@ -436,8 +436,11 @@ fn join_cell_blocks_plain(cell: &DocxCell) -> String {
 /// A cell with `grid_span = k` places its (joined) text in the first of its `k`
 /// columns and leaves the other `k - 1` empty (empty-fill). Vertical-merge
 /// continuation cells render empty. The `plain` flag selects the plain-text
-/// join. The result always has exactly `grid_width` entries (truncated/padded if
-/// the row's spans do not sum to the width).
+/// join. The result always has exactly `grid_width` entries. Because
+/// `docx_grid_width` treats `tblGrid` as a floor (it is at least the widest row),
+/// the trailing `resize` only ever PADS short rows — it never truncates a real
+/// cell. The per-cell span clamp remains only as defense against a single
+/// malformed span on a non-widest row.
 fn expand_row_to_grid(row: &DocxRow, grid_width: usize, plain: bool) -> Vec<String> {
     let mut cols: Vec<String> = Vec::with_capacity(grid_width);
     for c in &row.cells {
@@ -509,9 +512,14 @@ fn render_docx_grid(rows: &[&DocxRow], grid_width: usize) -> (String, String) {
 /// downstream (LLM) consumers.
 ///
 /// The one exception is a table that contains a nested table: a nested table
-/// cannot live inside a single GFM cell, so such a table is linearized — each
-/// cell's paragraphs and any nested table are emitted as standalone blocks.
-fn render_docx_table(table: &DocxTable) -> (String, String) {
+/// cannot live inside a single GFM cell, so the whole table is linearized — each
+/// cell's paragraphs and any nested table are emitted as standalone blocks. This
+/// is per-table (not per-row) by deliberate maintainer decision: consistency over
+/// prettiness. Only bugs within that path are fixed; the linearization is kept.
+///
+/// `warnings` collects a [`WarningCode::ResourceLimitReached`] entry if the table
+/// is so large that rows are dropped to honor `MAX_TABLE_CELLS`.
+fn render_docx_table(table: &DocxTable, warnings: &mut Vec<ConversionWarning>) -> (String, String) {
     if table.rows.is_empty() {
         return (String::new(), String::new());
     }
@@ -521,59 +529,112 @@ fn render_docx_table(table: &DocxTable) -> (String, String) {
         return (String::new(), String::new());
     }
 
-    // Common case: no nested tables → one empty-filled GFM grid.
+    // Common case: no nested tables → one empty-filled GFM grid. Bound the
+    // rendered area (rows × grid_width) at MAX_TABLE_CELLS: every cell is escaped
+    // and emitted, so an extreme grid would otherwise produce gigabytes of
+    // markdown. Excess rows are dropped — and, because dropping content must be
+    // observable, a ResourceLimitReached warning is appended.
     if !table.rows.iter().any(docx_row_has_nested_table) {
-        let rows: Vec<&DocxRow> = table.rows.iter().collect();
+        let max_rows = (MAX_TABLE_CELLS / grid_width).max(1);
+        if table.rows.len() > max_rows {
+            warnings.push(ConversionWarning {
+                code: WarningCode::ResourceLimitReached,
+                message: format!(
+                    "table truncated to {max_rows} rows (limit {MAX_TABLE_CELLS} cells)"
+                ),
+                location: None,
+            });
+        }
+        let rows: Vec<&DocxRow> = table.rows.iter().take(max_rows).collect();
         return render_docx_grid(&rows, grid_width);
     }
 
     // A nested table cannot be a grid cell: linearize the whole table, emitting
     // each cell's paragraphs and nested tables as standalone blocks in order.
+    // Linearization is per-table (whole table), not per-row, by deliberate
+    // maintainer decision (consistency over prettiness); only the bugs below are
+    // fixed within this path.
+    //
+    // Within the table, blocks are separated by one blank line in the markdown
+    // stream and one newline in the plain stream so adjacent paragraphs/tables do
+    // not fuse. A block is skipped when it has no meaningful content in EITHER
+    // stream (both md and plain trim empty), so a block with non-empty md but
+    // empty plain (e.g. an empty nested table) cannot inject a phantom blank line
+    // into plain or a degenerate empty GFM table into md.
     let mut md = String::new();
     let mut plain = String::new();
     for row in &table.rows {
         for c in &row.cells {
             for b in &c.blocks {
-                if b.md.trim().is_empty() {
+                let md_block = b.md.trim_end();
+                let plain_block = b.plain.trim_end();
+                // Skip unless the block carries content in at least one stream.
+                if md_block.trim_start().is_empty() && plain_block.trim_start().is_empty() {
                     continue;
                 }
-                md.push_str(b.md.trim_end());
-                md.push_str("\n\n");
-                plain.push_str(b.plain.trim_end());
-                plain.push('\n');
+                // Never emit a nested table whose rendered markdown is empty:
+                // it would otherwise contribute a degenerate empty GFM table.
+                if !(b.is_table && md_block.is_empty()) {
+                    md.push_str(md_block);
+                    md.push_str("\n\n");
+                }
+                if !(b.is_table && plain_block.is_empty()) {
+                    plain.push_str(plain_block);
+                    plain.push('\n');
+                }
             }
         }
     }
-    plain.push('\n');
+
+    // Normalize each stream to end in exactly one newline, matching the contract
+    // of `build_table`/`build_table_plain` on the normal-grid path: the per-block
+    // `"\n\n"` terminator leaves a trailing blank line on the last block, but the
+    // outer caller appends one more `\n` after the table. Trimming to a single
+    // trailing newline here means the caller's `\n` yields exactly one blank line
+    // before the following block — identical to a normal table (no extra blank
+    // line, the FINDING #11 regression).
+    let md = trim_to_single_trailing_newline(&md);
+    let plain = trim_to_single_trailing_newline(&plain);
 
     (md, plain)
+}
+
+/// Trim trailing whitespace and, if any content remains, re-append exactly one
+/// `\n`. An all-empty string stays empty. Matches the trailing-newline contract
+/// of the normal-grid table builders so callers can append a single `\n`
+/// uniformly regardless of which render path produced the table.
+fn trim_to_single_trailing_newline(s: &str) -> String {
+    let trimmed = s.trim_end();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}\n")
+    }
 }
 
 // ---- Table classification ----
 
 /// Authoritative grid width of a table.
 ///
-/// Uses the `<w:tblGrid>`/`<w:gridCol>` count when present (decision: tblGrid is
-/// authoritative). Falls back to the maximum over rows of the summed `grid_span`
-/// when the grid is absent or unparsed.
+/// The `<w:tblGrid>`/`<w:gridCol>` count is a FLOOR, not a ceiling: a row whose
+/// cells (by summed `grid_span`) are wider than the declared grid still keeps
+/// every cell. The width is therefore the maximum of the `tblGrid` count and the
+/// widest row, so `expand_row_to_grid` only ever pads — never truncates — a real
+/// cell. (Word occasionally emits a `tblGrid` narrower than an actual row; taking
+/// the ceiling there silently dropped trailing cells.) The grid is still bounded
+/// by `MAX_TABLE_COLS` so an extreme span/gridCol count cannot drive unbounded
+/// column allocation downstream.
 fn docx_grid_width(t: &DocxTable) -> usize {
-    let width = if t.grid_width > 0 {
-        t.grid_width
-    } else {
-        t.rows
-            .iter()
-            .map(|r| r.cells.iter().map(|c| c.grid_span.max(1)).sum::<usize>())
-            .max()
-            .unwrap_or(0)
-    };
-    // Bound the rendered grid width so an extreme span/gridCol count cannot drive
-    // unbounded column allocation downstream.
+    let widest_row = t
+        .rows
+        .iter()
+        .map(|r| r.cells.iter().map(|c| c.grid_span.max(1)).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    let width = t.grid_width.max(widest_row);
     width.min(MAX_TABLE_COLS)
 }
 
-/// Whether a row's cells exactly tile the full grid width.
-///
-/// True when the summed `grid_span` over all cells equals `grid_width`.
 /// Whether any cell in the row contains a nested-table block.
 ///
 /// A nested table cannot live inside a single GFM cell, so a table containing one
@@ -583,6 +644,23 @@ fn docx_row_has_nested_table(row: &DocxRow) -> bool {
     row.cells
         .iter()
         .any(|c| c.blocks.iter().any(|b| b.is_table))
+}
+
+/// Whether a buffered table has any content worth rendering.
+///
+/// A table with no cells, or whose every cell block is blank in both the markdown
+/// and plain streams, renders only to an empty/skeleton GFM table (e.g.
+/// `|  |\n|---|`). Such a table is suppressed entirely when it appears nested
+/// inside a cell, so it contributes no degenerate phantom table or stray blank
+/// line to the enclosing output.
+fn docx_table_has_content(t: &DocxTable) -> bool {
+    t.rows.iter().any(|r| {
+        r.cells.iter().any(|c| {
+            c.blocks
+                .iter()
+                .any(|b| !b.md.trim().is_empty() || !b.plain.trim().is_empty())
+        })
+    })
 }
 
 /// Merge adjacent segments with the same formatting, then apply `wrap_formatting`
@@ -1116,11 +1194,16 @@ fn parse_document(
                     }
                     "tbl" if !table_stack.is_empty() => {
                         let table = table_stack.pop().unwrap();
-                        let (table_md, table_plain) = render_docx_table(&table);
+                        // A content-empty nested/inner table would render only to a
+                        // degenerate skeleton (e.g. `|  |\n|---|`); skip it entirely
+                        // so it never injects a phantom table into markdown or a
+                        // stray blank line into plain text.
+                        let has_content = docx_table_has_content(&table);
+                        let (table_md, table_plain) = render_docx_table(&table, &mut warnings);
                         if table_stack.last().is_some_and(|f| f.in_cell) {
                             // Nested table: attach its rendered output to the
                             // enclosing cell as a block so it renders in place.
-                            if !table_md.is_empty() {
+                            if has_content && !table_md.is_empty() {
                                 table_stack.last_mut().unwrap().current_cell.blocks.push(
                                     DocxCellBlock {
                                         md: table_md,
@@ -1129,7 +1212,7 @@ fn parse_document(
                                     },
                                 );
                             }
-                        } else if !table_md.is_empty() {
+                        } else if has_content && !table_md.is_empty() {
                             // Outermost table: write to the document output.
                             output.push_str(&table_md);
                             output.push('\n');
@@ -1327,6 +1410,14 @@ fn parse_document(
 /// value cannot drive unbounded allocation when a row is expanded to the grid
 /// width. Far larger than any real table.
 const MAX_TABLE_COLS: usize = 4096;
+
+/// Upper bound on the number of rendered table cells (rows × grid width).
+///
+/// `MAX_TABLE_COLS` bounds the width, but the row count is otherwise unbounded:
+/// a hostile document with millions of `<w:tr>` rows would materialize and escape
+/// a grid of arbitrary size. This caps the product so worst-case output stays a
+/// few MB. Mirrors the HTML converter's value. Far larger than any real table.
+const MAX_TABLE_CELLS: usize = 100_000;
 
 /// Parse a `<w:tblGrid>`/`<w:tcPr>` child element (`gridCol`, `gridSpan`,
 /// `vMerge`) into the current table frame.
@@ -2819,6 +2910,84 @@ mod tests {
         assert_eq!(docx_grid_width(&t), 3);
     }
 
+    #[test]
+    fn test_docx_grid_width_tblgrid_is_floor_not_ceiling() {
+        // tblGrid declares 2 columns but a row actually has 3 single-span cells.
+        // The grid width must widen to 3 so no cell is dropped.
+        let t = DocxTable {
+            grid_width: 2,
+            rows: vec![row(vec![
+                cell("A", 1, VMerge::None),
+                cell("B", 1, VMerge::None),
+                cell("C", 1, VMerge::None),
+            ])],
+            ..Default::default()
+        };
+        assert_eq!(docx_grid_width(&t), 3);
+    }
+
+    #[test]
+    fn test_docx_grid_width_uniform_match_unchanged() {
+        // When tblGrid equals the widest row, the width is byte-identical (the
+        // floor change must not perturb ordinary uniform tables).
+        let t = DocxTable {
+            grid_width: 3,
+            rows: vec![
+                row(vec![
+                    cell("a", 1, VMerge::None),
+                    cell("b", 1, VMerge::None),
+                    cell("c", 1, VMerge::None),
+                ]),
+                row(vec![
+                    cell("d", 1, VMerge::None),
+                    cell("e", 1, VMerge::None),
+                    cell("f", 1, VMerge::None),
+                ]),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(docx_grid_width(&t), 3);
+    }
+
+    #[test]
+    fn test_docx_render_three_cells_in_two_col_grid_keeps_all() {
+        // 3 single-span cells A,B,C in a 2-col tblGrid: all three survive.
+        let t = DocxTable {
+            grid_width: 2,
+            rows: vec![
+                row(vec![
+                    cell("H1", 1, VMerge::None),
+                    cell("H2", 1, VMerge::None),
+                ]),
+                row(vec![
+                    cell("A", 1, VMerge::None),
+                    cell("B", 1, VMerge::None),
+                    cell("C", 1, VMerge::None),
+                ]),
+            ],
+            ..Default::default()
+        };
+        let (md, _plain) = render_docx_table(&t, &mut Vec::new());
+        assert!(md.contains("| A | B | C |"), "trailing cell dropped: {md}");
+    }
+
+    #[test]
+    fn test_docx_render_gridspan_overflow_keeps_trailing_cell() {
+        // A [gridSpan=2 X, Y] row in a 2-col grid sums to 3 > grid_width: Y must
+        // not be truncated. Grid widens to 3; X empty-fills its second column.
+        let t = DocxTable {
+            grid_width: 2,
+            rows: vec![row(vec![
+                cell("X", 2, VMerge::None),
+                cell("Y", 1, VMerge::None),
+            ])],
+            ..Default::default()
+        };
+        let (md, _plain) = render_docx_table(&t, &mut Vec::new());
+        // Single row => header only; X spans cols 1-2 (empty-filled), Y in col 3.
+        assert!(md.contains("| X |  | Y |"), "Y truncated: {md}");
+    }
+
     // ---- Grid render unit tests ----
 
     #[test]
@@ -2863,7 +3032,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (md, _plain) = render_docx_table(&t);
+        let (md, _plain) = render_docx_table(&t, &mut Vec::new());
         // One GFM table: the banner is the header row, empty-filled.
         assert!(md.contains("| Section Header |  |  |"), "md: {md}");
         assert!(md.contains("| A | B | C |"), "md: {md}");
@@ -2884,7 +3053,7 @@ mod tests {
             ])],
             ..Default::default()
         };
-        let (md, _plain) = render_docx_table(&t);
+        let (md, _plain) = render_docx_table(&t, &mut Vec::new());
         assert!(md.contains("| Date | Monday |  |"), "md: {md}");
         assert!(!md.contains("**Date:**"), "md: {md}");
     }
@@ -2908,7 +3077,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (md, _plain) = render_docx_table(&t);
+        let (md, _plain) = render_docx_table(&t, &mut Vec::new());
         assert!(md.contains("| A | B | C |"), "md: {md}");
         assert!(md.contains("| x | spans |  |"), "md: {md}");
     }
@@ -2930,7 +3099,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (md, _plain) = render_docx_table(&t);
+        let (md, _plain) = render_docx_table(&t, &mut Vec::new());
         assert!(md.contains("| Label | Head |"), "md: {md}");
         // The continuation cell is empty in the data row.
         assert!(md.contains("|  | Val |"), "md: {md}");
@@ -2953,7 +3122,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (md, _plain) = render_docx_table(&t);
+        let (md, _plain) = render_docx_table(&t, &mut Vec::new());
         assert!(md.contains("a\\|b"), "pipe not escaped: {md}");
     }
 
@@ -2972,7 +3141,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (_md, plain) = render_docx_table(&t);
+        let (_md, plain) = render_docx_table(&t, &mut Vec::new());
         assert!(plain.contains("Section"), "plain: {plain}");
         assert!(!plain.contains("**"), "plain has markers: {plain}");
         assert!(plain.contains("A\tB\tC"), "plain not tabbed: {plain}");
@@ -2997,7 +3166,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(render_docx_table(&t), render_docx_table(&t));
+        assert_eq!(
+            render_docx_table(&t, &mut Vec::new()),
+            render_docx_table(&t, &mut Vec::new())
+        );
     }
 
     #[test]
@@ -3063,6 +3235,89 @@ mod tests {
             !result.markdown.contains("before<br>"),
             "outer cell was crammed: {}",
             result.markdown
+        );
+    }
+
+    #[test]
+    fn test_docx_empty_nested_table_no_phantom_table_end_to_end() {
+        // An outer cell holds real text followed by a nested table whose only cell
+        // is empty. Driven through the REAL parser (not a hand-built block): the
+        // empty inner table renders to a degenerate skeleton (`|  |\n|---|`) and is
+        // suppressed entirely. With the empty nested table gone, the outer 1x1
+        // table is a clean grid `| OuterText |`; crucially there is NO second,
+        // phantom empty table and the markdown/plain streams agree on the content.
+        let body = r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>OuterText</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl></w:tc></w:tr></w:tbl>"#;
+        let doc = wrap_body(body);
+        let data = build_test_docx(&doc, None, None);
+        let result = DocxConverter
+            .convert(&data, &ConversionOptions::default())
+            .unwrap();
+        assert!(
+            result.markdown.contains("OuterText"),
+            "md: {:?}",
+            result.markdown
+        );
+        // The empty inner table contributed no skeleton: a single separator row
+        // (the outer table's own), and no empty `|  |` data cell from the inner one.
+        assert_eq!(
+            result.markdown.matches("---").count(),
+            1,
+            "phantom nested separator in md: {:?}",
+            result.markdown
+        );
+        assert!(
+            !result.markdown.contains("|  |"),
+            "phantom empty nested cell in md: {:?}",
+            result.markdown
+        );
+        // plain_text agrees on the content (the inner empty table left no residue).
+        assert!(
+            result.plain_text.contains("OuterText"),
+            "plain: {:?}",
+            result.plain_text
+        );
+        assert_eq!(
+            result.markdown.matches("OuterText").count(),
+            1,
+            "md: {:?}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn test_docx_linearize_skips_block_empty_in_both_streams() {
+        // A block empty in BOTH md and plain is skipped entirely; a sibling
+        // nested-table block keeps the table on the linearize path.
+        let t = DocxTable {
+            grid_width: 1,
+            rows: vec![row(vec![DocxCell {
+                grid_span: 1,
+                v_merge: VMerge::None,
+                blocks: vec![
+                    DocxCellBlock {
+                        md: "   ".to_string(),
+                        plain: "   ".to_string(),
+                        is_table: false,
+                    },
+                    DocxCellBlock {
+                        md: "| i |\n|---|\n| i |\n".to_string(),
+                        plain: "i\n".to_string(),
+                        is_table: true,
+                    },
+                ],
+            }])],
+            ..Default::default()
+        };
+        let (md, plain) = render_docx_table(&t, &mut Vec::new());
+        // Only the nested table content is present; the blank block contributed
+        // nothing to either stream.
+        assert!(
+            md.starts_with("| i |"),
+            "leading blank block leaked: {md:?}"
+        );
+        assert!(
+            plain.starts_with("i\n"),
+            "leading blank block leaked: {plain:?}"
         );
     }
 

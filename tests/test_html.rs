@@ -210,3 +210,34 @@ fn test_html_data_table_spanning_row_keeps_columns() {
         result.markdown
     );
 }
+
+/// Regression (best-effort-observable): an over-large table must surface a
+/// ResourceLimitReached warning through the public API rather than truncating
+/// silently.
+#[test]
+fn test_html_oversized_table_warns_end_to_end() {
+    use anytomd::WarningCode;
+    let cols = 1000usize;
+    let rows = 200usize; // 200_000 cells > MAX_TABLE_CELLS
+    let mut html = String::from("<html><body><table>");
+    for _ in 0..rows {
+        html.push_str("<tr>");
+        for c in 0..cols {
+            html.push_str("<td>");
+            html.push_str(&c.to_string());
+            html.push_str("</td>");
+        }
+        html.push_str("</tr>");
+    }
+    html.push_str("</table></body></html>");
+    let result =
+        anytomd::convert_bytes(html.as_bytes(), "html", &ConversionOptions::default()).unwrap();
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.code == WarningCode::ResourceLimitReached),
+        "no truncation warning surfaced: {:?}",
+        result.warnings
+    );
+}
