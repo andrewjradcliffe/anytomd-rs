@@ -517,13 +517,15 @@ fn render_docx_grid(rows: &[&DocxRow], grid_width: usize) -> (String, String) {
 /// is per-table (not per-row) by deliberate maintainer decision: consistency over
 /// prettiness. Only bugs within that path are fixed; the linearization is kept.
 ///
-/// `warnings` collects a [`WarningCode::ResourceLimitReached`] entry if the table
-/// is so large that rows are dropped to honor `MAX_TABLE_CELLS`.
+/// `warnings` collects [`WarningCode::ResourceLimitReached`] entries if the table
+/// is so large that rows (grid path) or blocks (linearize path) are dropped to
+/// honor `MAX_TABLE_CELLS`, or columns are dropped to honor `MAX_TABLE_COLS`.
 fn render_docx_table(table: &DocxTable, warnings: &mut Vec<ConversionWarning>) -> (String, String) {
     if table.rows.is_empty() {
         return (String::new(), String::new());
     }
 
+    let raw_width = docx_raw_grid_width(table);
     let grid_width = docx_grid_width(table);
     if grid_width == 0 {
         return (String::new(), String::new());
@@ -535,6 +537,18 @@ fn render_docx_table(table: &DocxTable, warnings: &mut Vec<ConversionWarning>) -
     // markdown. Excess rows are dropped — and, because dropping content must be
     // observable, a ResourceLimitReached warning is appended.
     if !table.rows.iter().any(docx_row_has_nested_table) {
+        // Capping the width drops trailing columns from the widest row(s); that
+        // must be observable too (mirrors the HTML converter's width-cap
+        // warning).
+        if raw_width > grid_width {
+            warnings.push(ConversionWarning {
+                code: WarningCode::ResourceLimitReached,
+                message: format!(
+                    "table row exceeded the {MAX_TABLE_COLS}-column limit; extra columns were dropped"
+                ),
+                location: None,
+            });
+        }
         let max_rows = (MAX_TABLE_CELLS / grid_width).max(1);
         if table.rows.len() > max_rows {
             warnings.push(ConversionWarning {
@@ -561,9 +575,16 @@ fn render_docx_table(table: &DocxTable, warnings: &mut Vec<ConversionWarning>) -
     // stream (both md and plain trim empty), so a block with non-empty md but
     // empty plain (e.g. an empty nested table) cannot inject a phantom blank line
     // into plain or a degenerate empty GFM table into md.
+    // The emitted blocks are bounded at MAX_TABLE_CELLS, the same budget the
+    // grid path enforces on its rendered cells: without it, a single nested
+    // table anywhere in an extreme-row-count table would divert rendering to
+    // this branch and bypass the cap entirely. Dropping blocks is observable
+    // via a ResourceLimitReached warning.
     let mut md = String::new();
     let mut plain = String::new();
-    for row in &table.rows {
+    let mut emitted_blocks = 0usize;
+    let mut truncated = false;
+    'rows: for row in &table.rows {
         for c in &row.cells {
             for b in &c.blocks {
                 let md_block = b.md.trim_end();
@@ -572,6 +593,11 @@ fn render_docx_table(table: &DocxTable, warnings: &mut Vec<ConversionWarning>) -
                 if md_block.trim_start().is_empty() && plain_block.trim_start().is_empty() {
                     continue;
                 }
+                if emitted_blocks >= MAX_TABLE_CELLS {
+                    truncated = true;
+                    break 'rows;
+                }
+                emitted_blocks += 1;
                 // Never emit a nested table whose rendered markdown is empty:
                 // it would otherwise contribute a degenerate empty GFM table.
                 if !(b.is_table && md_block.is_empty()) {
@@ -584,6 +610,15 @@ fn render_docx_table(table: &DocxTable, warnings: &mut Vec<ConversionWarning>) -
                 }
             }
         }
+    }
+    if truncated {
+        warnings.push(ConversionWarning {
+            code: WarningCode::ResourceLimitReached,
+            message: format!(
+                "table linearization truncated to {MAX_TABLE_CELLS} blocks (limit {MAX_TABLE_CELLS} cells)"
+            ),
+            location: None,
+        });
     }
 
     // Normalize each stream to end in exactly one newline, matching the contract
@@ -614,6 +649,19 @@ fn trim_to_single_trailing_newline(s: &str) -> String {
 
 // ---- Table classification ----
 
+/// Uncapped grid width of a table: the maximum of the declared `tblGrid` count
+/// and the widest row's summed spans. Callers compare this against the
+/// `MAX_TABLE_COLS`-capped width to detect (and warn about) dropped columns.
+fn docx_raw_grid_width(t: &DocxTable) -> usize {
+    let widest_row = t
+        .rows
+        .iter()
+        .map(|r| r.cells.iter().map(|c| c.grid_span.max(1)).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    t.grid_width.max(widest_row)
+}
+
 /// Authoritative grid width of a table.
 ///
 /// The `<w:tblGrid>`/`<w:gridCol>` count is a FLOOR, not a ceiling: a row whose
@@ -623,16 +671,10 @@ fn trim_to_single_trailing_newline(s: &str) -> String {
 /// cell. (Word occasionally emits a `tblGrid` narrower than an actual row; taking
 /// the ceiling there silently dropped trailing cells.) The grid is still bounded
 /// by `MAX_TABLE_COLS` so an extreme span/gridCol count cannot drive unbounded
-/// column allocation downstream.
+/// column allocation downstream; [`render_docx_table`] warns when that bound
+/// actually drops columns.
 fn docx_grid_width(t: &DocxTable) -> usize {
-    let widest_row = t
-        .rows
-        .iter()
-        .map(|r| r.cells.iter().map(|c| c.grid_span.max(1)).sum::<usize>())
-        .max()
-        .unwrap_or(0);
-    let width = t.grid_width.max(widest_row);
-    width.min(MAX_TABLE_COLS)
+    docx_raw_grid_width(t).min(MAX_TABLE_COLS)
 }
 
 /// Whether any cell in the row contains a nested-table block.
@@ -1197,9 +1239,16 @@ fn parse_document(
                         // A content-empty nested/inner table would render only to a
                         // degenerate skeleton (e.g. `|  |\n|---|`); skip it entirely
                         // so it never injects a phantom table into markdown or a
-                        // stray blank line into plain text.
+                        // stray blank line into plain text. Skip the render too:
+                        // a suppressed table contributes no output, so it must not
+                        // contribute a truncation warning either (a warning with
+                        // nothing visibly dropped would be a false positive).
                         let has_content = docx_table_has_content(&table);
-                        let (table_md, table_plain) = render_docx_table(&table, &mut warnings);
+                        let (table_md, table_plain) = if has_content {
+                            render_docx_table(&table, &mut warnings)
+                        } else {
+                            (String::new(), String::new())
+                        };
                         if table_stack.last().is_some_and(|f| f.in_cell) {
                             // Nested table: attach its rendered output to the
                             // enclosing cell as a block so it renders in place.
@@ -1416,7 +1465,9 @@ const MAX_TABLE_COLS: usize = 4096;
 /// `MAX_TABLE_COLS` bounds the width, but the row count is otherwise unbounded:
 /// a hostile document with millions of `<w:tr>` rows would materialize and escape
 /// a grid of arbitrary size. This caps the product so worst-case output stays a
-/// few MB. Mirrors the HTML converter's value. Far larger than any real table.
+/// few MB. The same budget bounds the blocks emitted by the nested-table
+/// linearization path, so routing a table through that path cannot bypass the
+/// cap. Mirrors the HTML converter's value. Far larger than any real table.
 const MAX_TABLE_CELLS: usize = 100_000;
 
 /// Parse a `<w:tblGrid>`/`<w:tcPr>` child element (`gridCol`, `gridSpan`,
@@ -3184,6 +3235,96 @@ mod tests {
         // Expanding the row must not allocate beyond the bound.
         let cols = expand_row_to_grid(&t.rows[0], docx_grid_width(&t), false);
         assert!(cols.len() <= MAX_TABLE_COLS);
+    }
+
+    #[test]
+    fn test_docx_linearize_path_blocks_capped_with_warning() {
+        // A nested table anywhere routes the whole table through the linearize
+        // path; the blocks it emits must honor MAX_TABLE_CELLS just like grid
+        // cells do, and dropping blocks must be observable.
+        let mut rows: Vec<DocxRow> = Vec::with_capacity(MAX_TABLE_CELLS + 2);
+        rows.push(row(vec![DocxCell {
+            grid_span: 1,
+            v_merge: VMerge::None,
+            blocks: vec![DocxCellBlock {
+                md: "| i |\n|---|".to_string(),
+                plain: "i".to_string(),
+                is_table: true,
+            }],
+        }]));
+        for i in 0..=MAX_TABLE_CELLS {
+            rows.push(row(vec![cell(&format!("r{i}"), 1, VMerge::None)]));
+        }
+        let t = DocxTable {
+            grid_width: 1,
+            rows,
+            ..Default::default()
+        };
+        let mut warnings = Vec::new();
+        let (md, plain) = render_docx_table(&t, &mut warnings);
+        assert!(md.contains("r0"), "early block missing");
+        let last = format!("r{MAX_TABLE_CELLS}");
+        assert!(
+            !md.contains(&last),
+            "linearized markdown not truncated: {} bytes",
+            md.len()
+        );
+        assert!(
+            !plain.contains(&last),
+            "linearized plain not truncated: {} bytes",
+            plain.len()
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == WarningCode::ResourceLimitReached),
+            "expected ResourceLimitReached warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_docx_overwide_row_columns_dropped_with_warning() {
+        // A row with more real cells than MAX_TABLE_COLS loses its trailing
+        // cells to the width cap; that drop must be observable (mirrors the
+        // HTML converter's width-cap warning).
+        let cells: Vec<DocxCell> = (0..MAX_TABLE_COLS + 5)
+            .map(|i| cell(&format!("c{i}"), 1, VMerge::None))
+            .collect();
+        let t = DocxTable {
+            grid_width: 0,
+            rows: vec![row(cells)],
+            ..Default::default()
+        };
+        let mut warnings = Vec::new();
+        let (md, _plain) = render_docx_table(&t, &mut warnings);
+        assert!(md.contains("c0"), "leading cell missing");
+        assert!(
+            !md.contains(&format!("c{MAX_TABLE_COLS}")),
+            "trailing cell beyond the width cap must be dropped"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == WarningCode::ResourceLimitReached),
+            "expected ResourceLimitReached warning, got: {warnings:?}"
+        );
+
+        // A table within the width bound must not warn.
+        let t_ok = DocxTable {
+            grid_width: 3,
+            rows: vec![row(vec![
+                cell("a", 1, VMerge::None),
+                cell("b", 1, VMerge::None),
+                cell("c", 1, VMerge::None),
+            ])],
+            ..Default::default()
+        };
+        let mut ok_warnings = Vec::new();
+        let _ = render_docx_table(&t_ok, &mut ok_warnings);
+        assert!(
+            ok_warnings.is_empty(),
+            "unexpected warning: {ok_warnings:?}"
+        );
     }
 
     #[test]

@@ -651,6 +651,76 @@ fn test_docx_table_rows_capped_with_warning() {
     );
 }
 
+/// Regression (review finding): a content-empty nested table is suppressed
+/// entirely, so it must not surface a ResourceLimitReached truncation warning —
+/// a warning without any visible output would be a false positive (nothing
+/// observable was dropped).
+#[test]
+fn test_docx_suppressed_empty_nested_table_emits_no_truncation_warning() {
+    use anytomd::WarningCode;
+
+    // Inner table: wide grid (1000 cols) ⇒ max_rows = MAX_TABLE_CELLS / 1000 =
+    // 100; 150 all-empty rows would trip the row cap, but every cell is blank so
+    // the whole inner table is suppressed and nothing visible is dropped.
+    let cols = "<w:gridCol w:w=\"1\"/>".repeat(1000);
+    let mut inner = format!("<w:tbl><w:tblGrid>{cols}</w:tblGrid>");
+    for _ in 0..150 {
+        inner.push_str(
+            r#"<w:tr><w:tc><w:tcPr><w:gridSpan w:val="1000"/></w:tcPr><w:p/></w:tc></w:tr>"#,
+        );
+    }
+    inner.push_str("</w:tbl>");
+    let body = format!(
+        r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>OUT</w:t></w:r></w:p>{inner}</w:tc></w:tr></w:tbl>"#
+    );
+
+    let data = build_docx_from_body(&body, None);
+    let result = anytomd::convert_bytes(&data, "docx", &ConversionOptions::default()).unwrap();
+
+    assert!(result.markdown.contains("OUT"), "outer cell text missing");
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.code == WarningCode::ResourceLimitReached),
+        "false-positive truncation warning for a fully suppressed table: {:?}",
+        result.warnings
+    );
+}
+
+/// Regression (review finding): an all-blank outer table over the row cap is
+/// discarded (no output), so it must not surface a truncation warning either.
+#[test]
+fn test_docx_all_blank_overlimit_table_emits_no_warning_and_no_output() {
+    use anytomd::WarningCode;
+
+    let cols = "<w:gridCol w:w=\"1\"/>".repeat(1000);
+    let mut body = format!("<w:tbl><w:tblGrid>{cols}</w:tblGrid>");
+    for _ in 0..150 {
+        body.push_str(
+            r#"<w:tr><w:tc><w:tcPr><w:gridSpan w:val="1000"/></w:tcPr><w:p/></w:tc></w:tr>"#,
+        );
+    }
+    body.push_str("</w:tbl>");
+
+    let data = build_docx_from_body(&body, None);
+    let result = anytomd::convert_bytes(&data, "docx", &ConversionOptions::default()).unwrap();
+
+    assert!(
+        !result.markdown.contains('|'),
+        "all-blank table should be discarded, got: {}",
+        result.markdown
+    );
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.code == WarningCode::ResourceLimitReached),
+        "false-positive truncation warning for a discarded table: {:?}",
+        result.warnings
+    );
+}
+
 /// Regression (review finding): a table that contains a nested table, followed
 /// by a paragraph, must have exactly one blank line between them — the same
 /// spacing as a normal table and the HTML linearize path (no extra blank line).
